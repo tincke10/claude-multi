@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Corrupt `config.json` is never overwritten**: a config that fails to parse
+  is copied to a backup next to it, left untouched, and the error is shown in
+  Preferences instead of silently resetting to the default `personal` account.
+- **Atomic config save**: `config.json` is written to a temp file and renamed,
+  so a crash mid-save can no longer truncate it.
+- **Preferences Save no longer reverts inherit decisions**: Skip/Merge choices
+  made in the Inheritance panel survive a later Save.
+- **Manual fallback commands are escaped per shell**: the clipboard commands
+  shown when the terminal can't be opened now quote paths for POSIX shells and
+  for PowerShell (including the per-account env vars), instead of always
+  assuming POSIX.
+
+### Changed
+
+- `config.json` is saved with `0600` permissions on Unix.
+- CI: clippy and the test suite now also run on macOS and Windows, and gate the
+  release builds.
+
 ## [0.6.0] — 2026-09-15
 
 ### Added

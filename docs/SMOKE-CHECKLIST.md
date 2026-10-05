@@ -248,6 +248,24 @@ missing project path (see step 15).
 
 ---
 
+## Config robustness
+
+- [ ] **Corrupt config is preserved:** quit the app, replace `config.json` with
+      invalid JSON (e.g. `{ nope`) and launch. The tray still opens; a backup copy
+      of the corrupt file appears next to it; the original file is **byte-identical**
+      (not reset to the default account).
+- [ ] **Error shown in Preferences:** with the corrupt file in place, open
+      Preferences → a clear error about the invalid `config.json` is displayed
+      (no silent default `personal` account). Saving does not overwrite the file.
+- [ ] **Recovery:** fix or delete the file, relaunch → Preferences loads normally.
+- [ ] **Inherit decision survives Save:** in the Inheritance panel click **Skip**
+      on a row, then without reloading edit anything (e.g. a label) and click
+      **Save**. Re-open the panel → the row is still `skipped` and
+      `inherit_overrides` in `config.json` still records it.
+- [ ] **Permissions (macOS/Linux):** `config.json` is mode `0600` after a save.
+
+---
+
 ## cms CLI
 
 - [ ] `cms --list` shows all configured accounts with logged-in emails.
