@@ -27,6 +27,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   there; the account's own files and foreign symlinks are untouched). Merge
   also drops links whose source entry was deleted. Windows copy-fallback
   entries can't be identified as inherited and are left in place.
+- **OS junk is never inherited**: `.DS_Store`, `Thumbs.db` and `desktop.ini`
+  are excluded from linking, from the Inheritance status and from conflict
+  detection (a Finder-made `.DS_Store` no longer counts as account content).
+  Links created earlier are cleaned up on the next launch.
 
 ### Changed
 

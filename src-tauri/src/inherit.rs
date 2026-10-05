@@ -20,6 +20,15 @@ pub const INHERITED_SUBDIRS: &[&str] = &["agents", "commands", "skills", "output
 /// into `~/.claude`. An existing dest file always wins (no overwrite, no merge).
 pub const SEEDED_FILES: &[&str] = &["settings.json"];
 
+/// OS-generated files never inherited (and never counted as account content).
+pub const OS_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
+/// True for names in `OS_JUNK`.
+/// Case-insensitive: Windows/macOS default filesystems are.
+pub fn is_os_junk(name: &str) -> bool {
+    OS_JUNK.iter().any(|j| j.eq_ignore_ascii_case(name))
+}
+
 /// One entry observed in an account's subdir during planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestEntry {
@@ -60,7 +69,7 @@ pub fn subdir_status(
     source_entries: &[String],
     dest_entries: &[DestEntry],
 ) -> InheritStatus {
-    if source_entries.is_empty() {
+    if source_entries.iter().all(|n| is_os_junk(n)) {
         return InheritStatus::None;
     }
     match decision {
@@ -97,7 +106,7 @@ pub fn plan_links(source_entries: &[String], dest_entries: &[DestEntry]) -> Vec<
     let existing: HashSet<&str> = dest_entries.iter().map(|e| e.name.as_str()).collect();
     let mut out: Vec<LinkAction> = source_entries
         .iter()
-        .filter(|n| !existing.contains(n.as_str()))
+        .filter(|n| !is_os_junk(n) && !existing.contains(n.as_str()))
         .map(|n| LinkAction { name: n.clone() })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -134,7 +143,12 @@ pub fn plan_prune(
     dest_entries: &[DestEntry],
     prune_all: bool,
 ) -> Vec<String> {
-    let planned: HashSet<&str> = source_entries.iter().map(String::as_str).collect();
+    // Junk is never planned, so existing junk links count as stale.
+    let planned: HashSet<&str> = source_entries
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !is_os_junk(n))
+        .collect();
     let mut out: Vec<String> = dest_entries
         .iter()
         .filter(|e| e.is_symlink)
@@ -147,9 +161,12 @@ pub fn plan_prune(
     out
 }
 
-/// True if the dest has any real (non-symlink) entry — i.e. account-owned content.
+/// True if the dest has any real (non-symlink) entry — i.e. account-owned
+/// content. OS junk (e.g. a Finder-made `.DS_Store`) is not account content.
 pub fn has_conflict(dest_entries: &[DestEntry]) -> bool {
-    dest_entries.iter().any(|e| !e.is_symlink)
+    dest_entries
+        .iter()
+        .any(|e| !e.is_symlink && !is_os_junk(&e.name))
 }
 
 /// Resolve what to do for one subdir from its persisted decision and current state.
@@ -465,6 +482,45 @@ mod core_tests {
     fn pruned(src_sub: &str, src: &[&str], dst: &[DestEntry], all: bool) -> Vec<String> {
         let src: Vec<String> = src.iter().map(|s| s.to_string()).collect();
         plan_prune(Path::new(src_sub), &src, dst, all)
+    }
+
+    #[test]
+    fn test_should_not_plan_links_for_os_junk() {
+        let src: Vec<String> = [".DS_Store", "Thumbs.db", "desktop.ini", "a.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let names: Vec<_> = plan_links(&src, &[]).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["a.md"]);
+    }
+
+    #[test]
+    fn test_should_not_report_conflict_when_dest_only_has_os_junk_files() {
+        // Finder drops .DS_Store into the account dir; that is not account content.
+        assert!(!has_conflict(&[dest(".DS_Store", false)]));
+        assert!(has_conflict(&[
+            dest(".DS_Store", false),
+            dest("own.md", false)
+        ]));
+    }
+
+    #[test]
+    fn test_should_report_none_status_when_source_has_only_os_junk() {
+        let src = vec![".DS_Store".to_string()];
+        assert_eq!(subdir_status(None, &src, &[]), InheritStatus::None);
+    }
+
+    #[test]
+    fn test_should_prune_os_junk_link_when_merge() {
+        let dst = vec![
+            link(".DS_Store", "/h/.claude/agents/.DS_Store"),
+            link("a.md", "/h/.claude/agents/a.md"),
+        ];
+        // .DS_Store still exists in the source, but is never planned.
+        assert_eq!(
+            pruned("/h/.claude/agents", &[".DS_Store", "a.md"], &dst, false),
+            vec![".DS_Store"]
+        );
     }
 
     #[test]
@@ -811,6 +867,39 @@ mod io_tests {
                                                                   // Pruning removes the link only, never its target inside the source.
         assert!(source.join("skills").join("a.md").is_file());
         assert!(source.join("skills").join("b.md").is_file());
+    }
+
+    #[test]
+    fn test_should_never_inherit_and_should_clean_existing_os_junk_links() {
+        let (source, cfg) = fixture("os_junk");
+        touch(&source.join("agents").join("a.md"));
+        touch(&source.join("agents").join(".DS_Store"));
+        // Pre-existing junk link from before the deny-list, plus a Finder-made
+        // real junk file in an account that otherwise has no own content.
+        std::fs::create_dir_all(cfg.join("agents")).unwrap();
+        symlink(
+            source.join("agents").join(".DS_Store"),
+            cfg.join("agents").join(".DS_Store"),
+        )
+        .unwrap();
+
+        let out = ensure_inherited(&source, &cfg, &HashMap::new()).unwrap();
+
+        assert!(out.needs_prompt.is_empty());
+        assert!(!is_link(&cfg.join("agents").join(".DS_Store"))); // cleaned
+        assert!(is_link(&cfg.join("agents").join("a.md")));
+        assert!(source.join("agents").join(".DS_Store").is_file()); // source intact
+    }
+
+    #[test]
+    fn test_should_not_prompt_when_dest_only_has_real_os_junk() {
+        let (source, cfg) = fixture("os_junk_real");
+        touch(&source.join("agents").join("a.md"));
+        touch(&cfg.join("agents").join(".DS_Store"));
+        let out = ensure_inherited(&source, &cfg, &HashMap::new()).unwrap();
+        assert!(out.needs_prompt.is_empty());
+        assert!(is_link(&cfg.join("agents").join("a.md")));
+        assert!(cfg.join("agents").join(".DS_Store").is_file()); // never removed
     }
 
     #[test]
