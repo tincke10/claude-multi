@@ -60,6 +60,7 @@ export default function App() {
         const accounts = cfg.accounts.map((a) => ({
           ...a,
           usage_limits: a.usage_limits ?? { session_tokens: null, weekly_tokens: null },
+          inherit_overrides: a.inherit_overrides ?? {},
         }));
         setConfig({ ...cfg, accounts, projects });
         setInheritAccount(firstId);
@@ -130,6 +131,7 @@ export default function App() {
     const id = nextId(cfg.accounts.map((a) => a.id), "a");
     setAccounts([...cfg.accounts, {
       id, label: "New account", config_dir: `${CLAUDE_DIR_PREFIX}new`,
+      inherit_overrides: {},
       usage_limits: { session_tokens: null, weekly_tokens: null },
     }]);
   };
@@ -152,6 +154,14 @@ export default function App() {
   const onInheritToggle = async (subdir: string, decision: InheritDecision) => {
     try {
       await setInheritDecision(inheritAccount, subdir, decision);
+      // Mirror the persisted decision locally so a later Save doesn't send a stale map.
+      setConfig((c) => c && {
+        ...c,
+        accounts: c.accounts.map((a) =>
+          a.id === inheritAccount
+            ? { ...a, inherit_overrides: { ...a.inherit_overrides, [subdir]: decision } }
+            : a),
+      });
       setInheritRows(await getInheritStatus(inheritAccount));
       setInheritErr(null);
     } catch (e) {

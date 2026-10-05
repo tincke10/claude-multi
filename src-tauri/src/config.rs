@@ -227,6 +227,39 @@ fn backup_corrupt(path: &Path) -> std::io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Preferences never edits `inherit_overrides` (only the tray prompt and
+/// `set_inherit_decision` do), so an incoming save must not clobber them: for
+/// every incoming account whose id exists on disk, the disk overrides win.
+/// New accounts keep the incoming (empty) map; accounts absent from `incoming`
+/// are dropped.
+pub fn merge_inherit_overrides(mut incoming: Config, on_disk: &Config) -> Config {
+    for account in &mut incoming.accounts {
+        if let Some(existing) = on_disk.account(&account.id) {
+            account.inherit_overrides = existing.inherit_overrides.clone();
+        }
+    }
+    incoming
+}
+
+/// Inserts `decisions` into one account's overrides and returns the merged map.
+pub fn apply_inherit_decisions(
+    cfg: &mut Config,
+    account_id: &str,
+    decisions: &HashMap<String, InheritDecision>,
+) -> Result<HashMap<String, InheritDecision>, String> {
+    let account = cfg
+        .accounts
+        .iter_mut()
+        .find(|a| a.id == account_id)
+        .ok_or("unknown account")?;
+    for (sub, decision) in decisions {
+        account
+            .inherit_overrides
+            .insert(sub.clone(), decision.clone());
+    }
+    Ok(account.inherit_overrides.clone())
+}
+
 /// Process-wide gate for config read-modify-write cycles. Reads are lock-free
 /// (saves are atomic); `update` serializes load → mutate → save. Never hold
 /// the closure across a dialog and never nest `update` calls: `Mutex` is not
@@ -573,5 +606,152 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(store.load().unwrap().terminal, "iterm");
+    }
+    fn acct(id: &str, dir: &str, ov: &[(&str, InheritDecision)]) -> Account {
+        Account {
+            id: id.into(),
+            label: id.into(),
+            config_dir: dir.into(),
+            inherit_overrides: ov.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            usage_limits: UsageLimits::default(),
+        }
+    }
+
+    fn cfg_of(accounts: Vec<Account>) -> Config {
+        Config {
+            accounts,
+            ..Config::default()
+        }
+    }
+
+    // S8
+    #[test]
+    fn test_should_keep_disk_overrides_when_incoming_has_none() {
+        let disk = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("agents", InheritDecision::Merge)],
+        )]);
+        let incoming = cfg_of(vec![acct("a", "~/.claude-a", &[])]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        assert_eq!(
+            merged.accounts[0].inherit_overrides.get("agents"),
+            Some(&InheritDecision::Merge)
+        );
+    }
+
+    // S9
+    #[test]
+    fn test_should_start_new_account_with_empty_overrides_when_absent_on_disk() {
+        let disk = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("agents", InheritDecision::Skip)],
+        )]);
+        let incoming = cfg_of(vec![
+            acct("a", "~/.claude-a", &[]),
+            acct("n", "~/.claude-n", &[]),
+        ]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        assert!(merged.account("n").unwrap().inherit_overrides.is_empty());
+    }
+
+    // S10
+    #[test]
+    fn test_should_drop_account_when_absent_from_incoming() {
+        let disk = cfg_of(vec![
+            acct("a", "~/.claude-a", &[]),
+            acct("d", "~/.claude-d", &[]),
+        ]);
+        let incoming = cfg_of(vec![acct("a", "~/.claude-a", &[])]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        assert!(merged.account("d").is_none());
+    }
+
+    // S11
+    #[test]
+    fn test_should_keep_overrides_by_id_when_config_dir_changes() {
+        let disk = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("skills", InheritDecision::Skip)],
+        )]);
+        let incoming = cfg_of(vec![acct("a", "~/.claude-renamed", &[])]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        let a = merged.account("a").unwrap();
+        assert_eq!(a.config_dir, "~/.claude-renamed");
+        assert_eq!(
+            a.inherit_overrides.get("skills"),
+            Some(&InheritDecision::Skip)
+        );
+    }
+
+    // S12
+    #[test]
+    fn test_should_save_with_empty_overrides_when_legacy_file_lacks_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"iterm","accounts":[{"id":"a","label":"A","config_dir":"~/.claude-a"}],"projects":[]}"#,
+        )
+        .unwrap();
+        let store = ConfigStore::new(path);
+        let incoming = store.load().unwrap();
+        store
+            .update(|d| {
+                *d = merge_inherit_overrides(incoming, d);
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.load().unwrap().accounts[0]
+            .inherit_overrides
+            .is_empty());
+    }
+
+    #[test]
+    fn test_should_insert_and_return_merged_map_when_applying_decisions() {
+        let mut cfg = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("agents", InheritDecision::Merge)],
+        )]);
+        let mut new = HashMap::new();
+        new.insert("skills".to_string(), InheritDecision::Skip);
+        let merged = apply_inherit_decisions(&mut cfg, "a", &new).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(cfg.accounts[0].inherit_overrides, merged);
+    }
+
+    #[test]
+    fn test_should_err_when_applying_decisions_to_unknown_account() {
+        let mut cfg = Config::default();
+        let err = apply_inherit_decisions(&mut cfg, "nope", &HashMap::new()).unwrap_err();
+        assert!(err.contains("unknown account"));
+    }
+
+    // S13
+    #[test]
+    fn test_should_keep_all_updates_when_threads_update_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ConfigStore::new(dir.path().join("config.json")));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .update(|c| {
+                            c.accounts.push(acct(&format!("t{i}"), "~/.claude-t", &[]));
+                            Ok(())
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // default "personal" + 8 pushed
+        assert_eq!(store.load().unwrap().accounts.len(), 9);
     }
 }
