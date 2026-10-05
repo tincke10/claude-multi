@@ -106,27 +106,6 @@ fn validate_project_dir(label: &str, path: &std::path::Path) -> Result<(), Strin
     }
 }
 
-/// Builds the paste-able fallback command: `CLAUDE_CONFIG_DIR='…' sh -c "<inner>"`.
-fn manual_sh(config_dir: &str, inner: &str) -> String {
-    format!("CLAUDE_CONFIG_DIR='{config_dir}' sh -c \"{inner}\"")
-}
-
-pub fn manual_command(config_dir: &str, project_path: &str) -> String {
-    manual_sh(config_dir, &format!("cd '{project_path}' && exec claude"))
-}
-
-pub fn manual_login_command(config_dir: &str) -> String {
-    manual_sh(config_dir, "exec claude")
-}
-
-pub fn manual_logout_command(config_dir: &str) -> String {
-    manual_sh(config_dir, "claude auth logout")
-}
-
-pub fn manual_relogin_command(config_dir: &str) -> String {
-    manual_sh(config_dir, "claude auth logout; claude auth login")
-}
-
 #[derive(Serialize)]
 pub struct TerminalInfo {
     pub id: String,
@@ -187,7 +166,7 @@ pub fn launch_session(
     let script_path = launcher::write_script(&script, adapter.kind).map_err(|e| e.to_string())?;
 
     adapters::spawn(&adapter, &script_path.to_string_lossy(), &pp).map_err(|e| {
-        let _ = app.clipboard().write_text(manual_command(&cd, &pp));
+        let _ = app.clipboard().write_text(launcher::manual_command(adapter.kind, &cd, &pp));
         format!(
             "Couldn't open terminal '{}' ({e}). The launch command was copied to your clipboard — paste it into any terminal.",
             adapter.id
@@ -247,22 +226,22 @@ fn run_account_action(
     let (script, fallback, what) = match action {
         AccountAction::Login => (
             launcher::build_login_script(adapter.kind, &cd),
-            manual_login_command(&cd),
+            launcher::manual_login_command(adapter.kind, &cd),
             "login",
         ),
         AccountAction::Session => (
             launcher::build_login_script(adapter.kind, &cd),
-            manual_login_command(&cd),
+            launcher::manual_login_command(adapter.kind, &cd),
             "the session",
         ),
         AccountAction::Logout => (
             launcher::build_logout_script(adapter.kind, &cd),
-            manual_logout_command(&cd),
+            launcher::manual_logout_command(adapter.kind, &cd),
             "logout",
         ),
         AccountAction::Relogin => (
             launcher::build_relogin_script(adapter.kind, &cd),
-            manual_relogin_command(&cd),
+            launcher::manual_relogin_command(adapter.kind, &cd),
             "re-login",
         ),
     };
@@ -342,42 +321,6 @@ pub fn set_inherit_decision(
         inherit::ensure_inherited(&source, &config_dir, &decisions).map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod fallback_tests {
-    use super::{
-        manual_command, manual_login_command, manual_logout_command, manual_relogin_command,
-    };
-    #[test]
-    fn test_should_build_manual_command_when_spawn_fails() {
-        let cmd = manual_command("/home/u/.claude-dino", "/repo");
-        assert_eq!(
-            cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"cd '/repo' && exec claude\""
-        );
-    }
-    #[test]
-    fn test_should_build_manual_login_command_when_spawn_fails() {
-        let cmd = manual_login_command("/home/u/.claude-dino");
-        assert_eq!(
-            cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"exec claude\""
-        );
-    }
-    #[test]
-    fn test_should_build_manual_logout_command_when_spawn_fails() {
-        let cmd = manual_logout_command("/home/u/.claude-dino");
-        assert_eq!(
-            cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"claude auth logout\""
-        );
-    }
-    #[test]
-    fn test_should_build_manual_relogin_command_when_spawn_fails() {
-        let cmd = manual_relogin_command("/home/u/.claude-dino");
-        assert_eq!(cmd, "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"claude auth logout; claude auth login\"");
-    }
 }
 
 #[cfg(test)]
