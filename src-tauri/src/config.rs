@@ -246,6 +246,35 @@ fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     opts.open(path)?.write_all(bytes)
 }
 
+/// Rejects configs where two accounts resolve to the same config dir, which
+/// would break per-account isolation (shared credentials, history, links).
+///
+/// Dirs are compared after `expand_tilde`, ignoring trailing separators and
+/// ASCII case: the default filesystems on macOS (APFS) and Windows (NTFS) are
+/// case-insensitive, so `~/.claude-Work` and `~/.claude-work` are the same
+/// directory there. On case-sensitive Linux this is stricter than necessary,
+/// which is the safe side (two accounts differing only by case are a trap).
+pub fn validate_unique_config_dirs(cfg: &Config) -> Result<(), String> {
+    fn normalize(dir: &str) -> String {
+        let expanded = crate::paths::expand_tilde(dir)
+            .to_string_lossy()
+            .to_string();
+        expanded.trim_end_matches(['/', '\\']).to_lowercase()
+    }
+    let mut seen: HashMap<String, &Account> = HashMap::new();
+    for account in &cfg.accounts {
+        if let Some(first) = seen.insert(normalize(&account.config_dir), account) {
+            return Err(format!(
+                "Accounts \"{}\" and \"{}\" share the config dir {}; each account needs its own.",
+                first.label,
+                account.label,
+                account.config_dir.trim_end_matches(['/', '\\'])
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Preferences never edits `inherit_overrides` (only the tray prompt and
 /// `set_inherit_decision` do), so an incoming save must not clobber them: for
 /// every incoming account whose id exists on disk, the disk overrides win.
@@ -506,6 +535,57 @@ mod tests {
         assert_eq!(loaded.accounts[0].id, "a");
         assert!(loaded.accounts[0].inherit_overrides.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn cfg_with_dirs(dirs: &[(&str, &str)]) -> Config {
+        Config {
+            accounts: dirs
+                .iter()
+                .map(|(label, dir)| Account {
+                    id: label.to_lowercase(),
+                    label: (*label).into(),
+                    config_dir: (*dir).into(),
+                    inherit_overrides: HashMap::new(),
+                    usage_limits: UsageLimits::default(),
+                })
+                .collect(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn test_should_reject_when_two_accounts_share_config_dir() {
+        let cfg = cfg_with_dirs(&[("Work", "~/.claude-new"), ("Home", "~/.claude-new")]);
+        let err = validate_unique_config_dirs(&cfg).unwrap_err();
+        assert!(err.contains("Work") && err.contains("Home"), "{err}");
+        assert!(err.contains("~/.claude-new"), "{err}");
+    }
+
+    #[test]
+    fn test_should_reject_when_config_dirs_differ_only_by_case() {
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-New"), ("B", "~/.claude-new")]);
+        assert!(validate_unique_config_dirs(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_when_config_dirs_differ_only_by_trailing_slash() {
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-new/"), ("B", "~/.claude-new")]);
+        assert!(validate_unique_config_dirs(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_when_tilde_and_expanded_dir_match() {
+        let home = crate::paths::expand_tilde("~/x");
+        let abs = home.parent().unwrap().join(".claude-new");
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-new"), ("B", abs.to_str().unwrap())]);
+        assert!(validate_unique_config_dirs(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_should_accept_when_config_dirs_are_distinct() {
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-a"), ("B", "~/.claude-b")]);
+        assert!(validate_unique_config_dirs(&cfg).is_ok());
+        assert!(validate_unique_config_dirs(&Config::default()).is_ok());
     }
 
     fn corrupt_backups(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

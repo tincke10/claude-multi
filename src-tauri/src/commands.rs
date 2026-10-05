@@ -119,6 +119,8 @@ pub fn get_config(app: AppHandle) -> Result<Config, String> {
 
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: Config) -> Result<(), String> {
+    // Reject before taking the store lock: pure check, nothing to persist yet.
+    crate::config::validate_unique_config_dirs(&config)?;
     // Preferences never edits inherit_overrides: keep whatever is on disk (a
     // tray-prompt decision may have landed since the UI loaded its copy).
     app.state::<ConfigStore>().update(|disk| {

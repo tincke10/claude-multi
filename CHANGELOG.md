@@ -31,6 +31,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are excluded from linking, from the Inheritance status and from conflict
   detection (a Finder-made `.DS_Store` no longer counts as account content).
   Links created earlier are cleaned up on the next launch.
+- **Two accounts can no longer share a config dir**: Preferences marks the
+  duplicated suffixes (case- and trailing-slash-insensitive) and disables
+  Save, and `save_config` rejects such a config server-side with an error
+  naming both accounts.
 
 ### Changed
 

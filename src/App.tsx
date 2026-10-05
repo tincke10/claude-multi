@@ -13,6 +13,23 @@ const CLAUDE_DIR_PREFIX = "~/.claude-";
 const suffixOf = (dir: string) =>
   dir.startsWith(CLAUDE_DIR_PREFIX) ? dir.slice(CLAUDE_DIR_PREFIX.length) : dir;
 
+// Same normalisation as the backend's `validate_unique_config_dirs`: ignore
+// trailing separators and case (macOS/Windows filesystems are case-insensitive).
+const normalizeSuffix = (dir: string) =>
+  suffixOf(dir).replace(/[\\/]+$/, "").toLowerCase();
+
+// Indices of accounts that share a config dir with another account.
+const duplicateDirIndices = (accounts: Account[]): Set<number> => {
+  const byDir = new Map<string, number[]>();
+  accounts.forEach((a, i) => {
+    const key = normalizeSuffix(a.config_dir);
+    byDir.set(key, [...(byDir.get(key) ?? []), i]);
+  });
+  const dup = new Set<number>();
+  byDir.forEach((idxs) => { if (idxs.length > 1) idxs.forEach((i) => dup.add(i)); });
+  return dup;
+};
+
 const nextId = (ids: string[], prefix: string) => {
   const max = ids.reduce((m, id) => {
     const match = id.match(new RegExp(`^${prefix}(\\d+)$`));
@@ -112,6 +129,8 @@ export default function App() {
   // Narrow once so the closures below operate on a non-null Config.
   const cfg: Config = config;
   const patch = (next: Partial<Config>) => setConfig({ ...cfg, ...next });
+  // Accounts sharing a config dir would break isolation: flag them, block Save.
+  const dupDirs = duplicateDirIndices(cfg.accounts);
   const setAccounts = (accounts: Account[]) => patch({ accounts });
   const setProjects = (projects: Project[]) => patch({ projects });
   // Patch one account's usage ceilings immutably.
@@ -223,7 +242,7 @@ export default function App() {
                 value={a.label}
                 onChange={(e) => setAccounts(updateAt(cfg.accounts, i, { label: e.target.value }))}
               />
-              <span className="affix">
+              <span className={`affix ${dupDirs.has(i) ? "affix--invalid" : ""}`}>
                 <span className="affix__prefix">{CLAUDE_DIR_PREFIX}</span>
                 <input
                   className="input affix__input"
@@ -240,6 +259,11 @@ export default function App() {
                 onClick={() => setAccounts(cfg.accounts.filter((_, j) => j !== i))}
               >✕</button>
             </div>
+            {dupDirs.has(i) && (
+              <p className="field-error">
+                Another account already uses <code>{a.config_dir}</code>. Each account needs its own config directory.
+              </p>
+            )}
             <div className="row account__limits">
               <label className="field">
                 <span className="field__label">Session (5h) ceiling</span>
@@ -353,7 +377,10 @@ export default function App() {
       </section>
 
       <footer className="app__footer">
-        <button className="btn btn--primary" onClick={save}>Save</button>
+        <button className="btn btn--primary" onClick={save} disabled={dupDirs.size > 0}>Save</button>
+        {dupDirs.size > 0 && (
+          <span className="status status--err">Fix the duplicate account config directories to save.</span>
+        )}
         {status && <span className={`status status--${status.kind}`}>{status.text}</span>}
       </footer>
     </div>
