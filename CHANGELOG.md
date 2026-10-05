@@ -20,6 +20,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for PowerShell (including the per-account env vars), instead of always
   assuming POSIX.
 
+- **Corrupt-config backups are private**: `config.json.corrupt-<ts>` is now
+  created with `0600` on Unix (it was `0644` while `config.json` is `0600`).
+
 ### Changed
 
 - `config.json` is saved with `0600` permissions on Unix.

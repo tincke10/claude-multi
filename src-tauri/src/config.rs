@@ -219,12 +219,31 @@ fn backup_corrupt(path: &Path) -> std::io::Result<PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%dT%H%M%S");
     let mut target = dir.join(format!("{prefix}{stamp}"));
     let mut n = 1;
-    while target.exists() {
-        target = dir.join(format!("{prefix}{stamp}-{n}"));
-        n += 1;
+    loop {
+        match create_private_new(&target, &bytes) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                target = dir.join(format!("{prefix}{stamp}-{n}"));
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    std::fs::write(&target, &bytes)?;
-    Ok(target)
+}
+
+/// Writes `bytes` to a brand-new file at `path` (fails with `AlreadyExists`
+/// instead of overwriting), created `0600` on Unix like `config.json` itself:
+/// the backup holds the same account data and must not be more exposed.
+fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
 }
 
 /// Preferences never edits `inherit_overrides` (only the tray prompt and
@@ -526,6 +545,21 @@ mod tests {
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{ not json");
         assert!(err.contains(&backups[0].display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_create_backup_with_0600_when_json_corrupt() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        let backups = corrupt_backups(dir.path());
+        assert_eq!(backups.len(), 1);
+        let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
