@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// How an account resolves a conflict between its own resources in a subdir and
 /// the shared resources inherited from `~/.claude`. Persisted per subdir name.
@@ -103,14 +104,38 @@ impl Default for Config {
     }
 }
 
+/// Result of a side-effect-free read of `config.json`.
+#[derive(Debug)]
+pub enum LoadOutcome {
+    Loaded(Config),
+    /// No file on disk (first run).
+    Missing,
+    /// The file exists but is unreadable or not valid config JSON.
+    Corrupt(String),
+}
+
 impl Config {
-    /// Tray-side load: falls back to `Config::default()` on a missing or
-    /// unreadable file (deliberate for first-run). Callers that must not
-    /// invent the default `personal` account (the `cms` CLI) use `try_load`.
-    pub fn load(path: &Path) -> Config {
+    /// Reads `path` without touching the filesystem beyond the read itself.
+    pub fn read(path: &Path) -> LoadOutcome {
         match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| Config::default()),
-            Err(_) => Config::default(),
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(cfg) => LoadOutcome::Loaded(cfg),
+                Err(e) => LoadOutcome::Corrupt(format!("config.json is invalid: {e}")),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => LoadOutcome::Missing,
+            Err(e) => LoadOutcome::Corrupt(format!("config.json is unreadable: {e}")),
+        }
+    }
+
+    /// Tray-side load: falls back to `Config::default()` on a missing or
+    /// corrupt file and never writes anything (it runs on every hover, so a
+    /// backup here would spam files). Mutating/launching paths use
+    /// `load_strict`; callers that must not invent the default `personal`
+    /// account (the `cms` CLI) use `try_load`.
+    pub fn load(path: &Path) -> Config {
+        match Config::read(path) {
+            LoadOutcome::Loaded(cfg) => cfg,
+            LoadOutcome::Missing | LoadOutcome::Corrupt(_) => Config::default(),
         }
     }
 
@@ -121,12 +146,41 @@ impl Config {
         serde_json::from_str(&s).map_err(|e| format!("config.json is invalid: {e}"))
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Strict load for the app: a missing file is a legitimate first run
+    /// (defaults); a corrupt one is backed up next to it and surfaced as an
+    /// error, leaving the original untouched so no later save can silently
+    /// replace it with defaults.
+    pub fn load_strict(path: &Path) -> Result<Config, String> {
+        match Config::read(path) {
+            LoadOutcome::Loaded(cfg) => Ok(cfg),
+            LoadOutcome::Missing => Ok(Config::default()),
+            LoadOutcome::Corrupt(reason) => {
+                let note = match backup_corrupt(path) {
+                    Ok(b) => format!("a copy was saved to {}", b.display()),
+                    Err(e) => format!("could not back it up: {e}"),
+                };
+                Err(format!(
+                    "{reason} ({note}). Fix or delete the file to continue."
+                ))
+            }
         }
+    }
+
+    /// Atomic save: write a sibling temp file, fsync, then rename over the
+    /// target, so a crash never leaves `config.json` empty or partial.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(json.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(())
     }
 
     pub fn account(&self, id: &str) -> Option<&Account> {
@@ -135,6 +189,75 @@ impl Config {
 
     pub fn project(&self, id: &str) -> Option<&Project> {
         self.projects.iter().find(|p| p.id == id)
+    }
+}
+
+/// Copies a corrupt `path` to `<path>.corrupt-<timestamp>` (never renames).
+/// Skips the copy when a sibling backup already holds identical bytes, since
+/// strict loads repeat on every click; a name clash gets a `-N` suffix.
+fn backup_corrupt(path: &Path) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(path)?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.json".into());
+    let prefix = format!("{file_name}.corrupt-");
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let p = entry.path();
+        let is_backup = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&prefix));
+        if is_backup && std::fs::read(&p).ok().as_deref() == Some(bytes.as_slice()) {
+            return Ok(p);
+        }
+    }
+    let stamp = chrono::Local::now().format("%Y%m%dT%H%M%S");
+    let mut target = dir.join(format!("{prefix}{stamp}"));
+    let mut n = 1;
+    while target.exists() {
+        target = dir.join(format!("{prefix}{stamp}-{n}"));
+        n += 1;
+    }
+    std::fs::write(&target, &bytes)?;
+    Ok(target)
+}
+
+/// Process-wide gate for config read-modify-write cycles. Reads are lock-free
+/// (saves are atomic); `update` serializes load → mutate → save. Never hold
+/// the closure across a dialog and never nest `update` calls: `Mutex` is not
+/// reentrant.
+pub struct ConfigStore {
+    path: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl ConfigStore {
+    pub fn new(path: PathBuf) -> Self {
+        ConfigStore {
+            path,
+            lock: Mutex::new(()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<Config, String> {
+        Config::load_strict(&self.path)
+    }
+
+    pub fn update<T>(&self, f: impl FnOnce(&mut Config) -> Result<T, String>) -> Result<T, String> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cfg = Config::load_strict(&self.path)?;
+        let out = f(&mut cfg)?;
+        cfg.save(&self.path).map_err(|e| e.to_string())?;
+        Ok(out)
     }
 }
 
@@ -331,5 +454,124 @@ mod tests {
         assert_eq!(loaded.accounts[0].id, "a");
         assert!(loaded.accounts[0].inherit_overrides.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn corrupt_backups(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("config.json.corrupt-"))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_should_return_defaults_without_backup_when_config_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = Config::load_strict(&path).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert!(corrupt_backups(dir.path()).is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_should_backup_and_err_leaving_file_identical_when_json_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = Config::load_strict(&path).unwrap_err();
+        assert!(err.contains("invalid"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        let backups = corrupt_backups(dir.path());
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{ not json");
+        assert!(err.contains(&backups[0].display().to_string()));
+    }
+
+    #[test]
+    fn test_should_not_duplicate_backup_when_strict_load_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        assert!(Config::load_strict(&path).is_err());
+        assert_eq!(corrupt_backups(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn test_should_keep_lenient_load_side_effect_free_when_json_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert_eq!(Config::load(&path), Config::default());
+        assert!(corrupt_backups(dir.path()).is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn test_should_leave_no_temp_file_when_save_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = Config {
+            terminal: "iterm".into(),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["config.json".to_string()]);
+        assert_eq!(Config::try_load(&path).unwrap(), cfg);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_keep_old_content_when_save_fails_before_persist() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "old content").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let res = Config::default().save(&path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(res.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old content");
+    }
+
+    #[test]
+    fn test_should_err_without_writing_when_store_update_on_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let store = ConfigStore::new(path.clone());
+        let res: Result<(), String> = store.update(|c| {
+            c.terminal = "x".into();
+            Ok(())
+        });
+        assert!(res.is_err());
+        assert!(store.load().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn test_should_persist_closure_changes_when_store_update_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(dir.path().join("config.json"));
+        let n = store
+            .update(|c| {
+                c.terminal = "iterm".into();
+                Ok(c.accounts.len())
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.load().unwrap().terminal, "iterm");
     }
 }
