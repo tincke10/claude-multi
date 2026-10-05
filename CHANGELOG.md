@@ -22,6 +22,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Corrupt-config backups are private**: `config.json.corrupt-<ts>` is now
   created with `0600` on Unix (it was `0644` while `config.json` is `0600`).
+- **Skip now un-inherits**: switching a subdir from Merge to Skip removes the
+  symlinks previously created into `~/.claude/<sub>` (only links pointing
+  there; the account's own files and foreign symlinks are untouched). Merge
+  also drops links whose source entry was deleted. Windows copy-fallback
+  entries can't be identified as inherited and are left in place.
 
 ### Changed
 
