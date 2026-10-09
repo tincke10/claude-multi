@@ -8,6 +8,7 @@
 use crate::launcher::posix_single_quote_escape;
 
 /// Hint appended when Orca refuses the worktree selector.
+#[cfg(target_os = "macos")]
 const SELECTOR_HINT: &str =
     "The project path must be an Orca repo or one of its worktrees (check the project path in Preferences).";
 
