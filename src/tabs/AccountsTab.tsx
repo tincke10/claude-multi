@@ -60,7 +60,8 @@ function Vessels({ o }: { o: AccountOverview }) {
       />
       {o.usage.models.map((m) => (
         <Vessel
-          key={m.label} name={m.label}
+          // Per-model limits are weekly (`weekly_scoped`), so they share the week's hint.
+          key={m.label} name={m.label} hint="7 days"
           percent={m.window.percent}
           caption={captionFor(m.window, now)} resetsIn={resetsInFor(m.window, now)}
         />

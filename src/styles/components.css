@@ -340,7 +340,9 @@
   grid-auto-flow: column;
   grid-auto-columns: minmax(0, 1fr);
   gap: 10px;
-  align-items: end;
+  /* Top-align so every vessel sits at the same height even when one has a
+     shorter caption. */
+  align-items: start;
 }
 .vessel { display: grid; gap: 6px; justify-items: center; text-align: center; }
 .vessel__svg { width: 100%; max-width: 64px; height: auto; display: block; }
