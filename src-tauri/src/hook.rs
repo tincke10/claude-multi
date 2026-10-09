@@ -282,21 +282,11 @@ pub fn spool_list(dir: &Path) -> Vec<String> {
     names
 }
 
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
 /// Writes `body` to `<dir>/<ts>-<rand>.json`: temp file (0600, hidden name)
 /// then rename, so a concurrent flush never reads a half-written event.
 pub fn spool_write(dir: &Path, ts_ms: u64, body: &str) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    create_private_dir(dir)?;
+    crate::paths::create_private_dir(dir)?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".spool-")
         .rand_bytes(12)
@@ -556,13 +546,17 @@ pub fn format_log_line(ts_ms: u64, msg: &str) -> String {
 /// Best-effort error log (`<app config dir>/hook.log`, 0600, size-capped).
 /// Never include secrets in `msg`.
 pub fn log_error(msg: &str) {
-    use std::io::Write;
     let Some(dir) = app_dir() else { return };
+    append_log(&dir, now_ms(), msg);
+}
+
+fn append_log(dir: &Path, ts_ms: u64, msg: &str) {
+    use std::io::Write;
     let path = dir.join("hook.log");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
         let _ = std::fs::remove_file(&path);
     }
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::paths::create_private_dir(dir);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -571,7 +565,7 @@ pub fn log_error(msg: &str) {
         opts.mode(0o600);
     }
     if let Ok(mut f) = opts.open(path) {
-        let _ = f.write_all(format_log_line(now_ms(), msg).as_bytes());
+        let _ = f.write_all(format_log_line(ts_ms, msg).as_bytes());
     }
 }
 
@@ -1291,6 +1285,51 @@ mod tests {
         assert!(l.ends_with('\n'));
         assert_eq!(l.matches('\n').count(), 1);
         assert!(l.contains("a b"));
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_create_spool_and_jobs_dirs_private_when_event_post_succeeded() {
+        let rig = Rig::new();
+        let spool = rig.dir.path().join("app").join("spool");
+        let send = send_fn(&rig.outcomes, &rig.sent);
+        let spawn = |_: &Path| Ok(());
+        let r = handle_hook(
+            HookPhase::End,
+            END,
+            &env(),
+            &cfg(true, true),
+            &spool,
+            100,
+            &send,
+            &spawn,
+        );
+        assert!(matches!(
+            r,
+            HookResult::Done {
+                delivery: Delivery::Sent,
+                spawned: true
+            }
+        ));
+        assert_eq!(mode_of(&spool), 0o700);
+        assert_eq!(mode_of(&spool.join("jobs")), 0o700);
+        assert_eq!(mode_of(spool.parent().unwrap()), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_create_log_dir_private_when_logging_first_error() {
+        let d = tempfile::tempdir().unwrap();
+        let app = d.path().join("app");
+        append_log(&app, 1, "boom");
+        assert_eq!(mode_of(&app), 0o700);
+        assert_eq!(mode_of(&app.join("hook.log")), 0o600);
     }
 
     // --- HTTP against a local stub (no external network) ---

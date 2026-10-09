@@ -227,7 +227,7 @@ pub fn job_file_name(session_id: &str) -> String {
 /// Writes the job file atomically with owner-only permissions.
 pub fn write_job(jobs_dir: &Path, job: &SummaryJob) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    std::fs::create_dir_all(jobs_dir)?;
+    crate::paths::create_private_dir(jobs_dir)?;
     let json = serde_json::to_vec(job).map_err(std::io::Error::other)?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".job-")

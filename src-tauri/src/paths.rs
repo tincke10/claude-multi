@@ -30,9 +30,40 @@ pub fn standalone_config_file_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join(APP_IDENTIFIER).join("config.json"))
 }
 
+/// Creates `dir` and any missing parents; on Unix every directory this call
+/// creates is 0700 (and `dir` itself is tightened if it already existed), so
+/// tracking state (spool, jobs, log) is never readable by other users.
+pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_create_every_missing_parent_private_when_creating_private_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let leaf = d.path().join("a").join("b").join("c");
+        create_private_dir(&leaf).unwrap();
+        for p in [d.path().join("a"), d.path().join("a/b"), leaf] {
+            let m = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(m, 0o700, "{}", p.display());
+        }
+    }
 
     #[test]
     fn test_should_expand_leading_tilde_when_path_starts_with_tilde_slash() {
