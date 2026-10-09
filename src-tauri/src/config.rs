@@ -14,6 +14,38 @@ pub enum InheritDecision {
     Skip,
 }
 
+/// What `<config_dir>/.claude.json` records about the signed-in account. Only
+/// non-secret display fields are read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OauthAccount {
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    /// `organizationRateLimitTier`, else `userRateLimitTier`.
+    pub rate_tier: Option<String>,
+    pub org_type: Option<String>,
+}
+
+/// Reads the `oauthAccount` block of `<config_dir>/.claude.json`. `None` when
+/// the file is missing, malformed or has no such block.
+pub fn read_oauth_account(config_dir: &std::path::Path) -> Option<OauthAccount> {
+    let raw = std::fs::read_to_string(config_dir.join(".claude.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let oauth = value.get("oauthAccount")?;
+    let field = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    Some(OauthAccount {
+        email: field("emailAddress"),
+        org_name: field("organizationName"),
+        rate_tier: field("organizationRateLimitTier").or_else(|| field("userRateLimitTier")),
+        org_type: field("organizationType"),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Account {
     pub id: String,
@@ -528,6 +560,44 @@ mod tests {
             usage_limits: UsageLimits::default(),
         };
         assert_eq!(account.logged_in_email(), None);
+    }
+
+    #[test]
+    fn test_should_read_tier_and_org_when_oauth_account_has_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"a@b.c","organizationName":"Acme","organizationRateLimitTier":"default_claude_max_20x","organizationType":"claude_max"}}"#,
+        )
+        .unwrap();
+        let o = read_oauth_account(dir.path()).unwrap();
+        assert_eq!(o.email.as_deref(), Some("a@b.c"));
+        assert_eq!(o.org_name.as_deref(), Some("Acme"));
+        assert_eq!(o.rate_tier.as_deref(), Some("default_claude_max_20x"));
+        assert_eq!(o.org_type.as_deref(), Some("claude_max"));
+    }
+
+    #[test]
+    fn test_should_fall_back_to_user_tier_when_org_tier_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"userRateLimitTier":"default_claude_pro"}}"#,
+        )
+        .unwrap();
+        let o = read_oauth_account(dir.path()).unwrap();
+        assert_eq!(o.rate_tier.as_deref(), Some("default_claude_pro"));
+        assert_eq!(o.org_name, None);
+    }
+
+    #[test]
+    fn test_should_return_none_when_claude_json_is_missing_or_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_oauth_account(dir.path()), None);
+        std::fs::write(dir.path().join(".claude.json"), "{not json").unwrap();
+        assert_eq!(read_oauth_account(dir.path()), None);
+        std::fs::write(dir.path().join(".claude.json"), "{}").unwrap();
+        assert_eq!(read_oauth_account(dir.path()), None);
     }
 
     #[test]

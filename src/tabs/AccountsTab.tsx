@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { Account, AccountOverview, AccountStatus, Config } from "../api";
+import { Account, AccountOverview, AccountStatus, Config, UsageWindow } from "../api";
 import {
   AuthAction, ACTION_LABEL, actionsFor, isSaved, roomVariant,
 } from "../lib/accounts";
-import { vesselCaption } from "../lib/usageText";
+import {
+  chipsFor, countdown, estimatedChip, freshnessChip, resetText, vesselCaption,
+} from "../lib/usageText";
 import Chip from "../components/Chip";
 import Room from "../components/Room";
 import Vessel from "../components/Vessel";
@@ -31,13 +33,46 @@ type Props = {
 
 const EMPTY_COPY = "This room is empty. Log in to start using and tracking this account.";
 
-// Session and week from the current (local estimate) overview data. The
-// per-model vessel appears only once real usage data carries models (Phase 4+).
+const nowSecs = () => Math.floor(Date.now() / 1000);
+
+// Under the vessel: the estimate / "no data yet" caption, else when it resets.
+function captionFor(w: UsageWindow, now: number): string | null {
+  return vesselCaption(w) ?? resetText(w.resets_at, now);
+}
+
+function resetsInFor(w: UsageWindow, now: number): string | undefined {
+  return w.resets_at !== null && w.resets_at > now ? countdown(w.resets_at - now) : undefined;
+}
+
+// Session and week with real usage; per-model vessels arrive with the endpoint.
 function Vessels({ o }: { o: AccountOverview }) {
+  const { session, week } = o.usage;
+  const now = nowSecs();
   return (
     <div className="vessels">
-      <Vessel name="Session" hint="5 hours" percent={o.session.percent} caption={vesselCaption(o.session)} />
-      <Vessel name="Week" hint="7 days" percent={o.week.percent} caption={vesselCaption(o.week)} />
+      <Vessel
+        name="Session" hint="5 hours" percent={session.percent}
+        caption={captionFor(session, now)} resetsIn={resetsInFor(session, now)}
+      />
+      <Vessel
+        name="Week" hint="7 days" percent={week.percent}
+        caption={captionFor(week, now)} resetsIn={resetsInFor(week, now)}
+      />
+    </div>
+  );
+}
+
+function RoomChips({ o }: { o: AccountOverview }) {
+  const { session, week, tier } = o.usage;
+  const chips = chipsFor({ tier, session: session.pacing, week: week.pacing });
+  const fresh = freshnessChip(session, week);
+  const estimated = estimatedChip(session, week);
+  return (
+    <div className="room__chips">
+      {o.status === "expired" && <Chip kind="warn">Session expired</Chip>}
+      {chips.map((c) => <Chip key={c.text} kind={c.kind}>{c.text}</Chip>)}
+      {estimated && <Chip kind="muted">{estimated}</Chip>}
+      {fresh && <Chip kind={fresh.stale ? "warn" : "muted"}>{fresh.text}</Chip>}
     </div>
   );
 }
@@ -122,9 +157,7 @@ export default function AccountsTab({ config: cfg, snapshot, patch, accountsOver
               {row && status !== null && status !== "logged_out" && (
                 <>
                   <Vessels o={row} />
-                  {status === "expired" && (
-                    <div className="room__chips"><Chip kind="warn">Session expired</Chip></div>
-                  )}
+                  <RoomChips o={row} />
                 </>
               )}
               {err && <p className="field-error">{err}</p>}

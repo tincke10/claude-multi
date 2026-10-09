@@ -363,6 +363,7 @@
   white-space: nowrap;
 }
 .chip--pace { color: var(--fill2); border-color: color-mix(in srgb, var(--fill2) 35%, transparent); }
+.chip--muted { color: var(--dim); }
 .chip--warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 
 @media (max-width: 640px) {

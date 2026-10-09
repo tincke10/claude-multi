@@ -191,6 +191,13 @@ pub fn is_self_command(command: &str) -> bool {
         )
 }
 
+/// The usage record cms wrote for `config_dir` (the EXPANDED path, hashed
+/// exactly as `cms` hashes `CLAUDE_CONFIG_DIR`). `None` when missing/malformed.
+pub fn read_usage_record(app_data: &Path, config_dir: &str) -> Option<UsageRecord> {
+    let raw = std::fs::read_to_string(record_path(app_data, config_dir)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 /// Atomically (0600, in a 0700 dir) writes the record unless `should_write`
 /// says to skip. Returns whether it wrote.
 pub fn record_usage(app_data: &Path, config_dir: &str, rec: &UsageRecord) -> std::io::Result<bool> {
@@ -507,6 +514,45 @@ mod tests {
 
     fn cmd_original(command: &str) -> serde_json::Value {
         serde_json::json!({"type":"command","command":command,"padding":0})
+    }
+
+    #[test]
+    fn test_should_read_a_record_written_by_the_recorder() {
+        let app = tempfile::tempdir().unwrap();
+        let dir = std::path::Path::new(&std::env::temp_dir()).join("cm-read-rec");
+        let dir = dir.to_string_lossy().to_string();
+        let r = rec(
+            1_791_587_592,
+            Some(ws(36.0, 1_791_593_400)),
+            Some(ws(85.0, 1_791_694_800)),
+        );
+        record_usage(app.path(), &dir, &r).unwrap();
+        assert_eq!(read_usage_record(app.path(), &dir), Some(r));
+    }
+
+    #[test]
+    fn test_should_parse_the_real_record_shape() {
+        let app = tempfile::tempdir().unwrap();
+        let path = record_path(app.path(), "/h/.claude-real");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"v":1,"captured_at":1791587592,"five_hour":{"used_percentage":36.0,"resets_at":1791593400},"seven_day":{"used_percentage":85.0,"resets_at":1791694800},"model":"Fable 5.1"}"#,
+        )
+        .unwrap();
+        let got = read_usage_record(app.path(), "/h/.claude-real").unwrap();
+        assert_eq!(got.five_hour.unwrap().used_percentage, 36.0);
+        assert_eq!(got.model.as_deref(), Some("Fable 5.1"));
+    }
+
+    #[test]
+    fn test_should_return_none_when_record_is_missing_or_malformed() {
+        let app = tempfile::tempdir().unwrap();
+        assert_eq!(read_usage_record(app.path(), "/h/.claude-none"), None);
+        let path = record_path(app.path(), "/h/.claude-bad");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "garbage").unwrap();
+        assert_eq!(read_usage_record(app.path(), "/h/.claude-bad"), None);
     }
 
     #[cfg(unix)]

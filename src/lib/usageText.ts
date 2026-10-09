@@ -1,7 +1,9 @@
+import type { Pacing, UsageWindow } from "../api";
 import { humanTokens } from "./accounts";
 
-export type Pacing = { kind: "under" | "on" | "over"; points: number };
+export type { Pacing };
 export type ChipSpec = { text: string; kind: "tier" | "pace" };
+export type FreshnessChip = { text: string; stale: boolean };
 
 function paceText(name: string, p: Pacing): string {
   if (p.kind === "on") return `${name} on pace`;
@@ -22,21 +24,55 @@ export function vesselLabels(models: string[] | undefined): string[] {
   return ["Session", "Week", ...(models ?? [])];
 }
 
-export const vesselValue = (percent: number | null): string => (percent === null ? "—" : `${percent}%`);
+export const vesselValue = (percent: number | null): string => (percent === null ? "—" : `${Math.round(percent)}%`);
 
 // Under the value: nothing when we have a percent; the estimate or "no data yet" otherwise.
-export function vesselCaption(u: { percent: number | null; used: number }): string | null {
+export function vesselCaption(u: { percent: number | null; est_tokens: number | null }): string | null {
   if (u.percent !== null) return null;
-  return u.used > 0 ? `${humanTokens(u.used)} tok · est.` : "no data yet";
+  return u.est_tokens !== null && u.est_tokens > 0 ? `${humanTokens(u.est_tokens)} tok · est.` : "no data yet";
 }
 
 export function vesselAriaLabel(name: string, percent: number | null, resetsIn?: string): string {
   if (percent === null) return `${name}: no data yet`;
-  return resetsIn ? `${name} ${percent}% used, resets in ${resetsIn}` : `${name} ${percent}% used`;
+  const shown = Math.round(percent);
+  return resetsIn ? `${name} ${shown}% used, resets in ${resetsIn}` : `${name} ${shown}% used`;
 }
 
 export function stalenessLabel(ageSecs: number): string {
   if (ageSecs < 60) return "just now";
   if (ageSecs < 3600) return `${Math.floor(ageSecs / 60)}m ago`;
   return `${Math.floor(ageSecs / 3600)}h ago`;
+}
+
+export const updatedText = (ageSecs: number): string => `Updated ${stalenessLabel(ageSecs)}`;
+
+// "Updated 3m ago" from the oldest reported reading; stale if either window is.
+export function freshnessChip(session: UsageWindow, week: UsageWindow): FreshnessChip | null {
+  const ages = [session, week].flatMap((w) => (w.age_secs === null ? [] : [w.age_secs]));
+  if (ages.length === 0) return null;
+  return { text: updatedText(Math.max(...ages)), stale: session.stale || week.stale };
+}
+
+export const estimatedChip = (session: UsageWindow, week: UsageWindow): string | null =>
+  session.source === "estimate" || week.source === "estimate" ? "Estimated" : null;
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+// "Resets in 2h 52m" within a day, "Resets Sun 02:00" (local time) beyond it.
+export function resetText(resetsAtSecs: number | null, nowSecs: number): string | null {
+  if (resetsAtSecs === null || resetsAtSecs <= nowSecs) return null;
+  const diff = resetsAtSecs - nowSecs;
+  if (diff < 24 * 3600) return `Resets in ${countdown(diff)}`;
+  const d = new Date(resetsAtSecs * 1000);
+  return `Resets ${WEEKDAYS[d.getDay()]} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+// "2h 52m", "3h", "12m"; never below "1m".
+export function countdown(diffSecs: number): string {
+  const mins = Math.max(1, Math.floor(diffSecs / 60));
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  if (h === 0) return `${m}m`;
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
 }

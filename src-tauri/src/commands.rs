@@ -526,19 +526,39 @@ pub async fn accounts_overview(app: AppHandle) -> Result<Vec<AccountOverview>, S
         let now = chrono::Utc::now();
         let session_since = usage::session_window_start(now);
         let week_since = usage::week_window_start(now);
+        let app_data = crate::paths::app_data_dir();
         cfg.accounts
             .iter()
             .map(|account| {
-                let dir_exists = expand_tilde(&account.config_dir).is_dir();
-                if !dir_exists {
+                let dir = expand_tilde(&account.config_dir);
+                let empty = usage::UsageSummary::default();
+                if !dir.is_dir() {
                     // Nothing to probe: skip the Keychain and the log scan.
                     let none = session::SessionStatus::LoggedOut { last_email: None };
-                    let empty = usage::UsageSummary::default();
-                    return overview::build_overview(account, &none, false, &empty, &empty);
+                    let inputs = overview::UsageInputs {
+                        record: None,
+                        session_estimate: &empty,
+                        week_estimate: &empty,
+                        oauth: None,
+                        now: now.timestamp(),
+                    };
+                    return overview::build_overview(account, &none, false, &inputs);
                 }
                 let status = session::account_session_status(account);
                 let windows = usage::account_usage(account, &[session_since, week_since]);
-                overview::build_overview(account, &status, true, &windows[0], &windows[1])
+                // The recorder hashes the EXPANDED dir it was launched with.
+                let record = app_data
+                    .as_deref()
+                    .and_then(|d| crate::statusline::read_usage_record(d, &dir.to_string_lossy()));
+                let oauth = crate::config::read_oauth_account(&dir);
+                let inputs = overview::UsageInputs {
+                    record: record.as_ref(),
+                    session_estimate: &windows[0],
+                    week_estimate: &windows[1],
+                    oauth: oauth.as_ref(),
+                    now: now.timestamp(),
+                };
+                overview::build_overview(account, &status, true, &inputs)
             })
             .collect()
     })
