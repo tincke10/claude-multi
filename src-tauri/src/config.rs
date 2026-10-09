@@ -341,6 +341,17 @@ pub fn merge_inherit_overrides(mut incoming: Config, on_disk: &Config) -> Config
     incoming
 }
 
+/// Everything `save_config` does to the incoming config before persisting it,
+/// as one pure step: keep the on-disk inherit decisions, resolve masked tracking
+/// secrets against the stored ones, then validate tracking on the RESOLVED
+/// values (validating the masked ones would accept a sentinel as a real token).
+pub fn merge_saved_config(incoming: Config, on_disk: &Config) -> Result<Config, String> {
+    let mut merged = merge_inherit_overrides(incoming, on_disk);
+    merged.tracking = crate::tracking::unmask_tracking(&merged.tracking, &on_disk.tracking);
+    crate::tracking::validate_tracking(&merged.tracking)?;
+    Ok(merged)
+}
+
 /// Inserts `decisions` into one account's overrides and returns the merged map.
 pub fn apply_inherit_decisions(
     cfg: &mut Config,
@@ -1015,5 +1026,62 @@ mod tests {
         }
         // default "personal" + 8 pushed
         assert_eq!(store.load().unwrap().accounts.len(), 9);
+    }
+
+    // merge_saved_config (R8.2 S3)
+    fn tracked(token: &str) -> Config {
+        let mut c = Config::default();
+        c.tracking.enabled = true;
+        c.tracking.ingest_url = "https://cm.example.workers.dev".into();
+        c.tracking.ingest_token = token.into();
+        c.tracking.grafana_token = "glc".into();
+        c
+    }
+
+    #[test]
+    fn test_should_keep_stored_tokens_when_saving_a_masked_config() {
+        let disk = tracked("secret-1");
+        let masked = Config {
+            tracking: crate::tracking::mask_tracking(&disk.tracking),
+            ..disk.clone()
+        };
+        let merged = merge_saved_config(masked, &disk).unwrap();
+        assert_eq!(merged, disk);
+    }
+
+    #[test]
+    fn test_should_never_store_sentinel_when_enabling_without_a_stored_token() {
+        let disk = Config::default(); // nothing stored
+        let mut incoming = tracked(crate::tracking::TOKEN_MASK);
+        incoming.tracking.grafana_token.clear();
+        let err = merge_saved_config(incoming, &disk).unwrap_err();
+        assert!(err.contains("ingest token"), "{err}");
+    }
+
+    #[test]
+    fn test_should_save_new_token_when_user_typed_one() {
+        let disk = tracked("old");
+        let mut incoming = disk.clone();
+        incoming.tracking.ingest_token = "brand-new".into();
+        let merged = merge_saved_config(incoming, &disk).unwrap();
+        assert_eq!(merged.tracking.ingest_token, "brand-new");
+    }
+
+    #[test]
+    fn test_should_keep_inherit_overrides_from_disk_when_merging_saved_config() {
+        let mut disk = tracked("t");
+        disk.accounts[0]
+            .inherit_overrides
+            .insert("agents".into(), InheritDecision::Merge);
+        let incoming = Config {
+            tracking: crate::tracking::mask_tracking(&disk.tracking),
+            accounts: Config::default().accounts,
+            ..disk.clone()
+        };
+        let merged = merge_saved_config(incoming, &disk).unwrap();
+        assert_eq!(
+            merged.accounts[0].inherit_overrides.get("agents"),
+            Some(&InheritDecision::Merge)
+        );
     }
 }

@@ -3,8 +3,10 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Account, Config, Project, TerminalInfo, InheritSubdirStatus, InheritDecision, UsageLimits,
-  getConfig, saveConfig, listTerminals, getInheritStatus, setInheritDecision,
+  TrackingConfig, TrackingCheck,
+  getConfig, saveConfig, listTerminals, getInheritStatus, setInheritDecision, testTrackingConnection,
 } from "./api";
+import { trackingProblem } from "./tracking";
 import "./App.css";
 
 // Account config dirs always live under `~/.claude-<suffix>` so they stay
@@ -56,6 +58,11 @@ export default function App() {
   const [inheritAccount, setInheritAccount] = useState<string>("");
   const [inheritRows, setInheritRows] = useState<InheritSubdirStatus[]>([]);
   const [inheritErr, setInheritErr] = useState<string | null>(null);
+  // Tracking: non-fatal warnings from the last save + the last connection test.
+  const [saveWarnings, setSaveWarnings] = useState<string[]>([]);
+  const [check, setCheck] = useState<TrackingCheck | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [checkErr, setCheckErr] = useState<string | null>(null);
 
   useEffect(() => {
     if (!IN_TAURI) {
@@ -107,7 +114,7 @@ export default function App() {
     if (!IN_TAURI) return;
     let unlisten: (() => void) | undefined;
     getCurrentWindow()
-      .onFocusChanged(({ payload: focused }) => { if (focused) setStatus(null); })
+      .onFocusChanged(({ payload: focused }) => { if (focused) { setStatus(null); setSaveWarnings([]); } })
       .then((u) => { unlisten = u; });
     return () => unlisten?.();
   }, []);
@@ -133,6 +140,13 @@ export default function App() {
   const dupDirs = duplicateDirIndices(cfg.accounts);
   const setAccounts = (accounts: Account[]) => patch({ accounts });
   const setProjects = (projects: Project[]) => patch({ projects });
+  const setTracking = (u: Partial<TrackingConfig>) => {
+    patch({ tracking: { ...cfg.tracking, ...u } });
+    setCheck(null); // a result for the old values would mislead
+    setCheckErr(null);
+  };
+  const trackingErr = trackingProblem(cfg.tracking);
+  const canTest = cfg.tracking.ingest_url.trim() !== "" && cfg.tracking.ingest_token !== "";
   // Patch one account's usage ceilings immutably.
   const setAccountLimits = (i: number, u: Partial<UsageLimits>) =>
     setAccounts(updateAt(cfg.accounts, i, { usage_limits: { ...cfg.accounts[i].usage_limits, ...u } }));
@@ -188,10 +202,33 @@ export default function App() {
     }
   };
 
+  const runCheck = async () => {
+    setChecking(true);
+    setCheck(null);
+    setCheckErr(null);
+    try {
+      setCheck(await testTrackingConnection(cfg.tracking));
+    } catch (e) {
+      setCheckErr(`${e}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
   const save = async () => {
     try {
-      await saveConfig(cfg);
-      setStatus({ kind: "ok", text: "Saved — the tray menu was updated." });
+      const warnings = await saveConfig(cfg);
+      setSaveWarnings(warnings);
+      // Re-fetch tracking so freshly typed tokens go back to the mask: the
+      // plain value must not linger in UI state after it is stored.
+      const fresh = await getConfig();
+      setConfig((c) => c && { ...c, tracking: fresh.tracking });
+      setStatus({
+        kind: "ok",
+        text: warnings.length > 0
+          ? `Saved with ${warnings.length} warning(s) — see Tracking.`
+          : "Saved — the tray menu was updated.",
+      });
       window.setTimeout(() => setStatus(null), 3000);
     } catch (e) {
       setStatus({ kind: "err", text: `Save failed: ${e}` });
@@ -376,10 +413,126 @@ export default function App() {
         ))}
       </section>
 
+      <section className="card">
+        <div className="card__head">
+          <h2 className="card__title">Tracking</h2>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={cfg.tracking.enabled}
+              onChange={(e) => setTracking({ enabled: e.target.checked })}
+            />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <p className="card__hint">
+          Opt-in. Reports session activity (counts, tokens, cost — never prompt text) to your own{" "}
+          <code>cm-ingest</code> Worker, and metrics to Grafana Cloud. Requires Claude Code 2.1.212 or newer.
+        </p>
+
+        <label className="field field--stack">
+          <span className="field__label">Ingest URL</span>
+          <input
+            className="input"
+            placeholder="https://cm-ingest.<you>.workers.dev"
+            value={cfg.tracking.ingest_url}
+            onChange={(e) => setTracking({ ingest_url: e.target.value })}
+          />
+        </label>
+        <label className="field field--stack">
+          <span className="field__label">Ingest token</span>
+          <input
+            className="input"
+            type="password"
+            autoComplete="off"
+            value={cfg.tracking.ingest_token}
+            onFocus={(e) => e.target.select()}
+            onChange={(e) => setTracking({ ingest_token: e.target.value })}
+          />
+        </label>
+
+        <p className="card__hint card__hint--sub">Grafana Cloud metrics (optional)</p>
+        <label className="field field--stack">
+          <span className="field__label">OTLP endpoint</span>
+          <input
+            className="input"
+            placeholder="https://otlp-gateway-<zone>.grafana.net/otlp"
+            value={cfg.tracking.grafana_otlp_endpoint}
+            onChange={(e) => setTracking({ grafana_otlp_endpoint: e.target.value })}
+          />
+        </label>
+        <div className="row">
+          <label className="field">
+            <span className="field__label">Instance ID</span>
+            <input
+              className="input"
+              value={cfg.tracking.grafana_instance_id}
+              onChange={(e) => setTracking({ grafana_instance_id: e.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span className="field__label">Access token</span>
+            <input
+              className="input"
+              type="password"
+              autoComplete="off"
+              value={cfg.tracking.grafana_token}
+              onFocus={(e) => e.target.select()}
+              onChange={(e) => setTracking({ grafana_token: e.target.value })}
+            />
+          </label>
+        </div>
+
+        <label className="check check--block">
+          <input
+            type="checkbox"
+            checked={cfg.tracking.summaries}
+            onChange={(e) => setTracking({ summaries: e.target.checked })}
+          />
+          <span>AI summary when a session ends <span className="muted">(runs a small Claude call per session; uses your quota)</span></span>
+        </label>
+
+        {trackingErr && <p className="field-error">{trackingErr}</p>}
+
+        <div className="row tracking__test">
+          <button className="btn btn--secondary" onClick={runCheck} disabled={!canTest || checking}>
+            {checking ? "Testing…" : "Test connection"}
+          </button>
+          <span className="muted">Uses the values above; saved tokens stay masked.</span>
+        </div>
+        {checkErr && <p className="field-error">Test failed: {checkErr}</p>}
+        {check && (
+          <ul className="check-result">
+            <li className={check.ingest_ok ? "check-result--ok" : "check-result--err"}>
+              Ingest: {check.ingest_message}
+            </li>
+            {check.grafana_ok !== null && (
+              <li className={check.grafana_ok ? "check-result--ok" : "check-result--err"}>
+                Grafana: {check.grafana_message}
+              </li>
+            )}
+            {check.warnings.map((w) => (
+              <li key={w} className="check-result--warn">{w}</li>
+            ))}
+          </ul>
+        )}
+        {saveWarnings.length > 0 && (
+          <div className="banner banner--warn">
+            <strong>Saved, but:</strong>
+            <ul className="banner__list">
+              {saveWarnings.map((w) => <li key={w}>{w}</li>)}
+            </ul>
+          </div>
+        )}
+      </section>
+
       <footer className="app__footer">
-        <button className="btn btn--primary" onClick={save} disabled={dupDirs.size > 0}>Save</button>
+        <button className="btn btn--primary" onClick={save} disabled={dupDirs.size > 0 || trackingErr !== null}>Save</button>
         {dupDirs.size > 0 && (
           <span className="status status--err">Fix the duplicate account config directories to save.</span>
+        )}
+        {trackingErr && dupDirs.size === 0 && (
+          <span className="status status--err">Fix the Tracking settings to save.</span>
         )}
         {status && <span className={`status status--${status.kind}`}>{status.text}</span>}
       </footer>

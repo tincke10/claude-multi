@@ -1,9 +1,9 @@
 use crate::config::{
-    apply_inherit_decisions, merge_inherit_overrides, Config, ConfigStore, InheritDecision,
+    apply_inherit_decisions, merge_saved_config, Config, ConfigStore, InheritDecision,
 };
 use crate::hooks_install::{self, HookPolicy};
 use crate::paths::expand_tilde;
-use crate::{adapters, inherit, launcher, session, tracking};
+use crate::{adapters, inherit, launcher, session, tracking, tracking_check};
 use serde::Serialize;
 use std::collections::HashMap;
 use tauri::{AppHandle, Manager};
@@ -137,7 +137,10 @@ pub struct TerminalInfo {
 
 #[tauri::command]
 pub fn get_config(app: AppHandle) -> Result<Config, String> {
-    load_config(&app)
+    // Secrets never reach the webview: tokens go out masked (see `tracking::TOKEN_MASK`).
+    let mut cfg = load_config(&app)?;
+    cfg.tracking = tracking::mask_tracking(&cfg.tracking);
+    Ok(cfg)
 }
 
 /// Returns non-fatal warnings (e.g. tracking hooks that could not be
@@ -147,12 +150,13 @@ pub fn get_config(app: AppHandle) -> Result<Config, String> {
 pub fn save_config(app: AppHandle, config: Config) -> Result<Vec<String>, String> {
     // Reject before taking the store lock: pure check, nothing to persist yet.
     crate::config::validate_unique_config_dirs(&config)?;
-    crate::tracking::validate_tracking(&config.tracking)?;
     // Preferences never edits inherit_overrides: keep whatever is on disk (a
-    // tray-prompt decision may have landed since the UI loaded its copy).
+    // tray-prompt decision may have landed since the UI loaded its copy). Masked
+    // tracking tokens resolve to the stored ones and tracking is validated on
+    // the resolved values; an Err here aborts before anything is written.
     let (was_enabled, now_enabled, dirs) = app.state::<ConfigStore>().update(|disk| {
         let was_enabled = disk.tracking.enabled;
-        *disk = merge_inherit_overrides(config, disk);
+        *disk = merge_saved_config(config, disk)?;
         let dirs: Vec<_> = disk
             .accounts
             .iter()
@@ -171,6 +175,28 @@ pub fn save_config(app: AppHandle, config: Config) -> Result<Vec<String>, String
         Vec::new()
     };
     Ok(warnings)
+}
+
+/// Connectivity check for the Preferences "Test connection" button. Runs on a
+/// blocking thread (network + a version probe) so the UI thread never stalls.
+/// Masked tokens resolve against the stored ones; the result carries no secrets.
+#[tauri::command]
+pub async fn test_tracking_connection(
+    app: AppHandle,
+    tracking: crate::config::TrackingConfig,
+) -> Result<tracking_check::TrackingCheck, String> {
+    let stored = load_config(&app)?.tracking;
+    let resolved = tracking::unmask_tracking(&tracking, &stored);
+    tauri::async_runtime::spawn_blocking(move || {
+        tracking_check::run_check(
+            &resolved,
+            &tracking_check::probe,
+            crate::cms_path::resolve(),
+            tracking_check::detect_claude_version(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -14,8 +14,11 @@ export type Account = {
   usage_limits: UsageLimits;
 };
 export type Project = { id: string; label: string; path: string; account: string };
-// Opt-in session tracking. Edited by the Preferences Tracking section; until
-// that lands the UI just round-trips it untouched through the spreads in App.tsx.
+// Opt-in session tracking, edited by the Preferences Tracking section. The
+// backend never sends the real tokens to the UI: a saved token arrives as
+// TOKEN_MASK, and sending TOKEN_MASK back on save means "keep the stored one".
+// Must match `tracking::TOKEN_MASK` in the backend.
+export const TOKEN_MASK = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";
 export type TrackingConfig = {
   enabled: boolean;
   ingest_url: string;
@@ -24,6 +27,15 @@ export type TrackingConfig = {
   grafana_instance_id: string;
   grafana_token: string;
   summaries: boolean;
+};
+// Result of "Test connection". Tokens are never echoed back.
+export type TrackingCheck = {
+  ingest_ok: boolean;
+  ingest_message: string;
+  grafana_ok: boolean | null;
+  grafana_message: string | null;
+  cms_path: string | null;
+  warnings: string[];
 };
 export type Config = {
   terminal: string;
@@ -53,3 +65,6 @@ export const setInheritDecision = (
   subdir: string,
   decision: InheritDecision,
 ) => invoke<void>("set_inherit_decision", { accountId, subdir, decision });
+
+export const testTrackingConnection = (tracking: TrackingConfig) =>
+  invoke<TrackingCheck>("test_tracking_connection", { tracking });

@@ -164,6 +164,45 @@ pub fn validate_tracking(t: &TrackingConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Sentinel the UI receives instead of a stored token, and sends back to mean
+/// "keep the stored one". Must match `TOKEN_MASK` in `src/api.ts`.
+pub const TOKEN_MASK: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+
+/// Copy of `t` that is safe to hand to the UI: every non-empty secret becomes
+/// `TOKEN_MASK` (empty stays empty so the UI can tell "unset" apart).
+pub fn mask_tracking(t: &TrackingConfig) -> TrackingConfig {
+    let mask = |v: &str| {
+        if v.is_empty() {
+            String::new()
+        } else {
+            TOKEN_MASK.to_string()
+        }
+    };
+    TrackingConfig {
+        ingest_token: mask(&t.ingest_token),
+        grafana_token: mask(&t.grafana_token),
+        ..t.clone()
+    }
+}
+
+/// Resolves the config the UI sent back against what is stored: a secret equal
+/// to `TOKEN_MASK` keeps the stored value (never the sentinel itself), any
+/// other value (including empty = clear) replaces it.
+pub fn unmask_tracking(incoming: &TrackingConfig, stored: &TrackingConfig) -> TrackingConfig {
+    let resolve = |new: &str, old: &str| {
+        if new == TOKEN_MASK {
+            old.to_string()
+        } else {
+            new.to_string()
+        }
+    };
+    TrackingConfig {
+        ingest_token: resolve(&incoming.ingest_token, &stored.ingest_token),
+        grafana_token: resolve(&incoming.grafana_token, &stored.grafana_token),
+        ..incoming.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +503,84 @@ mod tests {
     fn test_should_not_leak_secrets_in_debug_output() {
         let dbg = format!("{:?}", full());
         assert!(!dbg.contains("tok-123") && !dbg.contains("glc_abc"));
+    }
+
+    // ---- masking (R8.2 S3) ----
+
+    #[test]
+    fn test_should_mask_non_empty_secrets_when_serving_to_ui() {
+        let m = mask_tracking(&full());
+        assert_eq!(m.ingest_token, TOKEN_MASK);
+        assert_eq!(m.grafana_token, TOKEN_MASK);
+        // non-secret fields pass through untouched
+        assert_eq!(m.ingest_url, full().ingest_url);
+        assert_eq!(m.grafana_instance_id, "12345");
+        assert!(m.enabled);
+    }
+
+    #[test]
+    fn test_should_keep_empty_secrets_empty_when_masking() {
+        let mut t = full();
+        t.ingest_token.clear();
+        t.grafana_token.clear();
+        let m = mask_tracking(&t);
+        assert_eq!(m.ingest_token, "");
+        assert_eq!(m.grafana_token, "");
+    }
+
+    #[test]
+    fn test_should_not_contain_any_secret_when_masked_config_is_serialized() {
+        let json = serde_json::to_string(&mask_tracking(&full())).unwrap();
+        assert!(!json.contains("tok-123"));
+        assert!(!json.contains("glc_abc"));
+    }
+
+    #[test]
+    fn test_should_keep_stored_secrets_when_masked_round_trips() {
+        let stored = full();
+        let back = unmask_tracking(&mask_tracking(&stored), &stored);
+        assert_eq!(back, stored);
+    }
+
+    #[test]
+    fn test_should_replace_secret_when_user_typed_a_new_one() {
+        let stored = full();
+        let mut incoming = mask_tracking(&stored);
+        incoming.ingest_token = "new-token".into();
+        let back = unmask_tracking(&incoming, &stored);
+        assert_eq!(back.ingest_token, "new-token");
+        assert_eq!(back.grafana_token, "glc_abc"); // untouched one keeps stored
+    }
+
+    #[test]
+    fn test_should_clear_secret_when_user_emptied_the_field() {
+        let stored = full();
+        let mut incoming = mask_tracking(&stored);
+        incoming.grafana_token.clear();
+        let back = unmask_tracking(&incoming, &stored);
+        assert_eq!(back.grafana_token, "");
+        assert_eq!(back.ingest_token, "tok-123");
+    }
+
+    #[test]
+    fn test_should_never_persist_sentinel_when_nothing_is_stored() {
+        let mut stored = full();
+        stored.ingest_token.clear();
+        let mut incoming = full();
+        incoming.ingest_token = TOKEN_MASK.into();
+        let back = unmask_tracking(&incoming, &stored);
+        assert_eq!(back.ingest_token, "");
+    }
+
+    #[test]
+    fn test_should_apply_non_secret_edits_when_secrets_are_masked() {
+        let stored = full();
+        let mut incoming = mask_tracking(&stored);
+        incoming.ingest_url = "https://other.example.workers.dev".into();
+        incoming.enabled = false;
+        let back = unmask_tracking(&incoming, &stored);
+        assert_eq!(back.ingest_url, "https://other.example.workers.dev");
+        assert!(!back.enabled);
+        assert_eq!(back.ingest_token, "tok-123");
     }
 }

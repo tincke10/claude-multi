@@ -11,6 +11,7 @@ pub mod paths;
 pub mod session;
 pub mod summary;
 pub mod tracking;
+pub mod tracking_check;
 pub mod tray;
 pub mod usage;
 
@@ -28,6 +29,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_config,
+            commands::test_tracking_connection,
             commands::list_terminals,
             commands::launch_session,
             commands::open_session,
