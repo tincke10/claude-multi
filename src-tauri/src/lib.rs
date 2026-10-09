@@ -7,6 +7,7 @@ pub mod hook;
 pub mod hooks_install;
 pub mod inherit;
 pub mod launcher;
+pub mod orca;
 pub mod paths;
 pub mod session;
 pub mod summary;
