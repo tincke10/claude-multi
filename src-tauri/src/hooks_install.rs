@@ -8,9 +8,9 @@
 //! `command` whose file name is `cms`/`cms.exe`. No custom JSON keys, so the
 //! settings schema can never reject the file.
 
+use crate::settings_file::EditError;
 use serde_json::{json, Value};
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// First argument that marks a hook handler as ours.
@@ -207,19 +207,8 @@ pub fn merge_tracking_hooks(
     Ok(settings)
 }
 
-/// The default user-level config dir, which must never be written.
 fn default_claude_dir() -> PathBuf {
-    crate::paths::expand_tilde("~/.claude")
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
-    let cb = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
-    ca == cb
-}
-
-fn io_err(e: std::io::Error) -> HooksError {
-    HooksError::Io(e.to_string())
+    crate::settings_file::default_claude_dir()
 }
 
 /// Install (`cms = Some`) or remove (`cms = None`) the tracking hooks in
@@ -243,55 +232,16 @@ fn ensure_hooks_in(
     policy: HookPolicy,
     default_dir: &Path,
 ) -> Result<bool, HooksError> {
-    if same_dir(config_dir, default_dir) {
-        return Err(HooksError::Refused(
-            "the default ~/.claude directory is never modified".into(),
-        ));
-    }
-    let settings = config_dir.join("settings.json");
-    let existing = match std::fs::symlink_metadata(&settings) {
-        // We never write through a link, so a linked file holds none of our
-        // entries: removal is a no-op, installation is refused.
-        Ok(m) if m.file_type().is_symlink() => {
-            return match cms {
-                None => Ok(false),
-                Some(_) => Err(HooksError::Refused(format!(
-                    "{} is a symlink",
-                    settings.display()
-                ))),
-            };
-        }
-        Ok(m) => Some(m.permissions()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_err(e)),
-    };
-
-    let current: Value = match &existing {
-        Some(_) => {
-            let raw = std::fs::read_to_string(&settings).map_err(io_err)?;
-            serde_json::from_str(&raw).map_err(|e| HooksError::Malformed(e.to_string()))?
-        }
-        None if cms.is_none() => return Ok(false),
-        None => json!({}),
-    };
-
     let cms_str = cms.map(|p| p.to_string_lossy().into_owned());
-    let merged = merge_tracking_hooks(current.clone(), cms_str.as_deref(), policy)?;
-    if existing.is_some() && merged == current {
-        return Ok(false);
-    }
-
-    std::fs::create_dir_all(config_dir).map_err(io_err)?;
-    let mut body =
-        serde_json::to_string_pretty(&merged).map_err(|e| HooksError::Io(e.to_string()))?;
-    body.push('\n');
-    let mut tmp = tempfile::NamedTempFile::new_in(config_dir).map_err(io_err)?;
-    tmp.write_all(body.as_bytes()).map_err(io_err)?;
-    if let Some(perms) = existing {
-        tmp.as_file().set_permissions(perms).map_err(io_err)?;
-    }
-    tmp.persist(&settings).map_err(|e| io_err(e.error))?;
-    Ok(true)
+    crate::settings_file::edit_settings_in(config_dir, cms.is_some(), default_dir, |current| {
+        merge_tracking_hooks(current, cms_str.as_deref(), policy)
+    })
+    .map_err(|e| match e {
+        EditError::Refused(why) => HooksError::Refused(why),
+        EditError::Malformed(e) => HooksError::Malformed(e),
+        EditError::Io(e) => HooksError::Io(e),
+        EditError::Edit(e) => e,
+    })
 }
 
 /// Apply the tracking toggle to one account dir with an already-resolved cms.

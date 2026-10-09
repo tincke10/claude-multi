@@ -114,6 +114,27 @@ impl std::fmt::Debug for TrackingConfig {
     }
 }
 
+/// Where real usage numbers come from. Every field is optional on disk, so
+/// configs written before this existed still load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UsageSourcesConfig {
+    /// Install `cms --statusline` in each account to record rate limits from
+    /// Claude Code's own statusline stream (on by default; reversible).
+    pub statusline_enabled: bool,
+    /// Opt-in: query Anthropic's (undocumented) OAuth usage endpoint.
+    pub endpoint_enabled: bool,
+}
+
+impl Default for UsageSourcesConfig {
+    fn default() -> Self {
+        Self {
+            statusline_enabled: true,
+            endpoint_enabled: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub terminal: String,
@@ -121,6 +142,8 @@ pub struct Config {
     pub projects: Vec<Project>,
     #[serde(default)]
     pub tracking: TrackingConfig,
+    #[serde(default)]
+    pub usage: UsageSourcesConfig,
 }
 
 impl Default for Config {
@@ -143,6 +166,7 @@ impl Default for Config {
             }],
             projects: vec![],
             tracking: TrackingConfig::default(),
+            usage: UsageSourcesConfig::default(),
         }
     }
 }
@@ -830,6 +854,46 @@ mod tests {
         std::fs::write(&path, r#"{"terminal":"iterm","accounts":[],"projects":[]}"#).unwrap();
         let cfg = Config::try_load(&path).unwrap();
         assert_eq!(cfg.tracking, TrackingConfig::default());
+    }
+
+    #[test]
+    fn test_should_default_usage_sources_to_statusline_on_and_endpoint_off() {
+        let u = Config::default().usage;
+        assert!(u.statusline_enabled);
+        assert!(!u.endpoint_enabled);
+    }
+
+    #[test]
+    fn test_should_load_usage_defaults_when_legacy_config_has_no_usage_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"terminal":"iterm","accounts":[],"projects":[]}"#).unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert_eq!(cfg.usage, UsageSourcesConfig::default());
+    }
+
+    #[test]
+    fn test_should_keep_statusline_on_when_usage_object_sets_only_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[],"usage":{"endpoint_enabled":true}}"#,
+        )
+        .unwrap();
+        let u = Config::try_load(&path).unwrap().usage;
+        assert!(u.statusline_enabled && u.endpoint_enabled);
+    }
+
+    #[test]
+    fn test_should_roundtrip_usage_sources_when_saved_and_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        cfg.usage.statusline_enabled = false;
+        cfg.usage.endpoint_enabled = true;
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::try_load(&path).unwrap().usage, cfg.usage);
     }
 
     #[test]

@@ -13,6 +13,7 @@ const base = (): Config => ({
     enabled: false, ingest_url: "", ingest_token: "", grafana_otlp_endpoint: "",
     grafana_instance_id: "", grafana_token: "", summaries: false,
   },
+  usage: { statusline_enabled: true, endpoint_enabled: false },
 });
 
 describe("tabErrors", () => {

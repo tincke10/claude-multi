@@ -269,6 +269,7 @@ mod tests {
             accounts: vec![account("work"), account("home")],
             projects,
             tracking: Default::default(),
+            usage: Default::default(),
         }
     }
 

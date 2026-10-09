@@ -113,6 +113,7 @@ mod tests {
             }],
             projects: vec![],
             tracking: Default::default(),
+            usage: Default::default(),
         }
     }
 

@@ -19,7 +19,6 @@
 
 use crate::config::Account;
 use crate::paths::expand_tilde;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -68,9 +67,10 @@ enum CredentialSource {
 /// pure and unit-tested on every OS.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn keychain_service(config_dir: &str) -> String {
-    let digest = Sha256::digest(config_dir.as_bytes());
-    let hash8: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    format!("Claude Code-credentials-{hash8}")
+    format!(
+        "Claude Code-credentials-{}",
+        crate::paths::config_dir_hash8(config_dir)
+    )
 }
 
 /// Pure expiry evaluation over the credentials JSON (`claudeAiOauth` payload).

@@ -41,11 +41,19 @@ export type TrackingCheck = {
   cms_path: string | null;
   warnings: string[];
 };
+// Where real usage numbers come from. Mirrors `config::UsageSourcesConfig`.
+export type UsageSourcesConfig = {
+  // Install `cms --statusline` per account to read rate limits from Claude Code's statusline.
+  statusline_enabled: boolean;
+  // Opt-in (later phase): Anthropic's undocumented OAuth usage endpoint.
+  endpoint_enabled: boolean;
+};
 export type Config = {
   terminal: string;
   accounts: Account[];
   projects: Project[];
   tracking: TrackingConfig;
+  usage: UsageSourcesConfig;
 };
 export type TerminalInfo = { id: string; label: string };
 

@@ -26,6 +26,9 @@ pub enum CliCommand {
     Hook {
         phase: HookPhase,
     },
+    /// `cms --statusline`: the statusLine command Claude Code runs (stdin JSON
+    /// -> record usage + chain the user's statusline). Flag form on purpose.
+    Statusline,
     /// `cms --auto [claude args...]`: pick the account from the working
     /// directory (project path / worktree roots), then launch like
     /// `cms <account>`. Flag form so an account named `auto` still launches.
@@ -263,6 +266,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             },
             _ => CliCommand::Help { explicit: false },
         },
+        Some("--statusline") => CliCommand::Statusline,
         Some("--auto") => CliCommand::Auto {
             claude_args: args[1..].to_vec(),
         },
@@ -589,6 +593,18 @@ mod tests {
     }
 
     use crate::config::TrackingConfig;
+
+    #[test]
+    fn test_should_parse_statusline_flag_regardless_of_extra_args() {
+        assert!(matches!(
+            parse_cli_args(&args(&["--statusline"])),
+            CliCommand::Statusline
+        ));
+        assert!(matches!(
+            parse_cli_args(&args(&["--statusline", "x"])),
+            CliCommand::Statusline
+        ));
+    }
 
     fn enabled_tracking() -> TrackingConfig {
         TrackingConfig {

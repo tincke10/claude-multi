@@ -7,7 +7,9 @@ use claude_multi_lib::cli::{
     CliCommand,
 };
 use claude_multi_lib::config::Config;
-use claude_multi_lib::{hook, hooks_install, inherit, paths, session, summary};
+use claude_multi_lib::{
+    hook, hooks_install, inherit, paths, session, statusline, statusline_install, summary,
+};
 use std::process::ExitCode;
 
 fn usage() -> String {
@@ -90,6 +92,17 @@ fn launch_under(
         }
     }
 
+    // Usage statusline: same policy (KeepExisting, best-effort). Runs after
+    // the seed above so the user's seeded statusLine is the one preserved.
+    if cfg.usage.statusline_enabled {
+        let dir = paths::expand_tilde(&account.config_dir);
+        if let Err(e) =
+            statusline_install::sync_account(&dir, true, hooks_install::HookPolicy::KeepExisting)
+        {
+            eprintln!("warning: usage statusline not installed: {e}");
+        }
+    }
+
     exec_claude(account, &cfg.tracking, claude_args)
 }
 
@@ -104,13 +117,19 @@ fn run() -> Result<ExitCode, String> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    // Same for the statusline: Claude Code renders our stdout, so no config
+    // load, no usage text, and always exit 0.
+    if args.first().map(String::as_str) == Some("--statusline") {
+        statusline::run();
+        return Ok(ExitCode::SUCCESS);
+    }
     match parse_cli_args(&args) {
         CliCommand::Summarize { job } => {
             summary::run_worker(&job);
             Ok(ExitCode::SUCCESS)
         }
         // Handled above; kept for exhaustiveness.
-        CliCommand::Hook { .. } => Ok(ExitCode::SUCCESS),
+        CliCommand::Hook { .. } | CliCommand::Statusline => Ok(ExitCode::SUCCESS),
         CliCommand::Help { explicit } => {
             let text = match load_config() {
                 Ok(cfg) => format!("{}\n\nAccounts:\n{}", usage(), account_list(&cfg)),

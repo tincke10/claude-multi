@@ -100,6 +100,7 @@ mod tests {
             accounts: vec![account("work"), account("home")],
             projects,
             tracking: Default::default(),
+            usage: Default::default(),
         };
         let path = dir.path().join("config.json");
         cfg.save(&path).unwrap();

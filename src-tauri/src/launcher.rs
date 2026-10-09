@@ -16,7 +16,7 @@ pub(crate) fn posix_single_quote_escape(s: &str) -> String {
 
 /// Escapes single quotes for PowerShell single-quoted strings.
 /// Each `'` in the value becomes `''` (doubled single quote).
-fn powershell_single_quote_escape(s: &str) -> String {
+pub(crate) fn powershell_single_quote_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
 
