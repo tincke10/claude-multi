@@ -85,3 +85,27 @@ export type OrcaHealthCheck = {
 // `supported` is false off macOS, where the Orca card is not shown at all.
 export type OrcaHealth = { supported: boolean; checks: OrcaHealthCheck[] };
 export const orcaHealth = () => invoke<OrcaHealth>("orca_health");
+
+// Import from Orca. Candidate/selection fields are snake_case like Project.
+export type CandidateStatus =
+  | { kind: "new" }
+  | { kind: "already_mapped"; project: string }
+  | { kind: "missing" };
+export type ImportCandidate = {
+  orca_repo_id: string;
+  label: string;
+  path: string;
+  worktree_roots: string[];
+  status: CandidateStatus;
+};
+export type ImportList = {
+  source: "cli" | "sqlite";
+  // The worktree list was cut off, so derived worktree roots may be incomplete.
+  truncated: boolean;
+  candidates: ImportCandidate[];
+};
+export type ImportSelection = { orca_repo_id: string; account_id: string };
+export const listOrcaImportCandidates = () => invoke<ImportList>("list_orca_import_candidates");
+// Resolves to the projects the backend persisted (it never reloads the window's state).
+export const importOrcaRepos = (selections: ImportSelection[]) =>
+  invoke<Project[]>("import_orca_repos", { selections });

@@ -7,6 +7,7 @@ import {
   getConfig, saveConfig, listTerminals, getInheritStatus, setInheritDecision, testTrackingConnection,
 } from "./api";
 import OrcaPanel from "./OrcaPanel";
+import { appendImported } from "./orca";
 import { trackingProblem } from "./tracking";
 import { parseWorktreeRoots, formatWorktreeRoots, worktreeRootsProblem } from "./worktreeRoots";
 import "./App.css";
@@ -439,7 +440,13 @@ export default function App() {
         ))}
       </section>
 
-      {IN_TAURI && <OrcaPanel />}
+      {IN_TAURI && (
+        <OrcaPanel
+          accounts={cfg.accounts}
+          onImported={(added) =>
+            setConfig((c) => c && { ...c, projects: appendImported(c.projects, added) })}
+        />
+      )}
 
       <section className="card">
         <div className="card__head">

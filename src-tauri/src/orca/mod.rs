@@ -9,6 +9,7 @@
 
 pub mod derive;
 pub mod health;
+pub mod import;
 pub mod model;
 pub mod plan;
 #[cfg(target_os = "macos")]
