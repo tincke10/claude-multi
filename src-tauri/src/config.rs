@@ -74,11 +74,47 @@ pub struct UsageLimits {
     pub weekly_tokens: Option<u64>,
 }
 
+/// Opt-in session tracking: where telemetry goes and with which credentials.
+/// Disabled by default; every field is optional on disk so configs written
+/// before this existed still load. The tokens are secrets (config.json is
+/// 0600): `Debug` redacts them so they never reach a log line.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct TrackingConfig {
+    pub enabled: bool,
+    /// Base URL of the `cm-ingest` Worker.
+    pub ingest_url: String,
+    pub ingest_token: String,
+    /// Grafana Cloud OTLP gateway, e.g. `https://otlp-gateway-<zone>.grafana.net/otlp`.
+    pub grafana_otlp_endpoint: String,
+    pub grafana_instance_id: String,
+    pub grafana_token: String,
+    /// Post an AI-written summary when a session ends.
+    pub summaries: bool,
+}
+
+impl std::fmt::Debug for TrackingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |s: &str| if s.is_empty() { "" } else { "<redacted>" }.to_string();
+        f.debug_struct("TrackingConfig")
+            .field("enabled", &self.enabled)
+            .field("ingest_url", &self.ingest_url)
+            .field("ingest_token", &redact(&self.ingest_token))
+            .field("grafana_otlp_endpoint", &self.grafana_otlp_endpoint)
+            .field("grafana_instance_id", &self.grafana_instance_id)
+            .field("grafana_token", &redact(&self.grafana_token))
+            .field("summaries", &self.summaries)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub terminal: String,
     pub accounts: Vec<Account>,
     pub projects: Vec<Project>,
+    #[serde(default)]
+    pub tracking: TrackingConfig,
 }
 
 impl Default for Config {
@@ -100,6 +136,7 @@ impl Default for Config {
                 usage_limits: UsageLimits::default(),
             }],
             projects: vec![],
+            tracking: TrackingConfig::default(),
         }
     }
 }
@@ -255,15 +292,9 @@ fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// directory there. On case-sensitive Linux this is stricter than necessary,
 /// which is the safe side (two accounts differing only by case are a trap).
 pub fn validate_unique_config_dirs(cfg: &Config) -> Result<(), String> {
-    fn normalize(dir: &str) -> String {
-        let expanded = crate::paths::expand_tilde(dir)
-            .to_string_lossy()
-            .to_string();
-        expanded.trim_end_matches(['/', '\\']).to_lowercase()
-    }
     let mut seen: HashMap<String, &Account> = HashMap::new();
     for account in &cfg.accounts {
-        if let Some(first) = seen.insert(normalize(&account.config_dir), account) {
+        if let Some(first) = seen.insert(normalize_config_dir(&account.config_dir), account) {
             return Err(format!(
                 "Accounts \"{}\" and \"{}\" share the config dir {}; each account needs its own.",
                 first.label,
@@ -273,6 +304,27 @@ pub fn validate_unique_config_dirs(cfg: &Config) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Canonical form used to compare config dirs: tilde-expanded, no trailing
+/// separator, lowercased (see `validate_unique_config_dirs` for why).
+fn normalize_config_dir(dir: &str) -> String {
+    let expanded = crate::paths::expand_tilde(dir)
+        .to_string_lossy()
+        .to_string();
+    expanded.trim_end_matches(['/', '\\']).to_lowercase()
+}
+
+/// Finds the account whose `config_dir` is `dir` (e.g. the `CLAUDE_CONFIG_DIR`
+/// a hook runs under). An empty `dir` never matches.
+pub fn find_account_by_dir<'a>(cfg: &'a Config, dir: &str) -> Option<&'a Account> {
+    let wanted = normalize_config_dir(dir);
+    if wanted.is_empty() {
+        return None;
+    }
+    cfg.accounts
+        .iter()
+        .find(|a| normalize_config_dir(&a.config_dir) == wanted)
 }
 
 /// Preferences never edits `inherit_overrides` (only the tray prompt and
@@ -743,6 +795,88 @@ mod tests {
             inherit_overrides: ov.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
             usage_limits: UsageLimits::default(),
         }
+    }
+
+    // R5.1 S1
+    #[test]
+    fn test_should_default_tracking_to_disabled_when_default_config() {
+        let t = Config::default().tracking;
+        assert!(!t.enabled);
+        assert!(t.ingest_url.is_empty() && t.ingest_token.is_empty());
+    }
+
+    // R5.1 S3
+    #[test]
+    fn test_should_load_with_default_tracking_when_legacy_config_has_no_tracking_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"terminal":"iterm","accounts":[],"projects":[]}"#).unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert_eq!(cfg.tracking, TrackingConfig::default());
+    }
+
+    #[test]
+    fn test_should_load_partial_tracking_when_only_some_fields_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[],"tracking":{"enabled":true,"ingest_url":"https://x"}}"#,
+        )
+        .unwrap();
+        let t = Config::try_load(&path).unwrap().tracking;
+        assert!(t.enabled);
+        assert_eq!(t.ingest_url, "https://x");
+        assert!(t.grafana_token.is_empty());
+    }
+
+    // R5.7 S13: saved through ConfigStore::update (the only write path)
+    #[cfg(unix)]
+    #[test]
+    fn test_should_persist_tracking_with_0600_when_saved_via_config_store_update() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        Config::default().save(&path).unwrap();
+        let store = ConfigStore::new(path.clone());
+        store
+            .update(|c| {
+                c.tracking.enabled = true;
+                c.tracking.ingest_token = "secret".into();
+                Ok(())
+            })
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let back = Config::try_load(&path).unwrap();
+        assert!(back.tracking.enabled);
+        assert_eq!(back.tracking.ingest_token, "secret");
+    }
+
+    #[test]
+    fn test_should_keep_incoming_tracking_when_merging_inherit_overrides() {
+        let disk = Config::default();
+        let mut incoming = Config::default();
+        incoming.tracking.enabled = true;
+        incoming.tracking.ingest_url = "https://x".into();
+        let merged = merge_inherit_overrides(incoming.clone(), &disk);
+        assert_eq!(merged.tracking, incoming.tracking);
+    }
+
+    // find_account_by_dir (cms --hook account resolution, R7.1 S1-S2)
+    #[test]
+    fn test_should_find_account_when_dir_matches_after_tilde_and_trailing_slash() {
+        let cfg = cfg_with_dirs(&[("Work", "~/.claude-work"), ("Home", "~/.claude-home")]);
+        let dir = crate::paths::expand_tilde("~/.claude-home/");
+        let found = find_account_by_dir(&cfg, &dir.to_string_lossy()).unwrap();
+        assert_eq!(found.id, "home");
+    }
+
+    #[test]
+    fn test_should_not_find_account_when_dir_is_unmatched_or_empty() {
+        let cfg = cfg_with_dirs(&[("Work", "~/.claude-work")]);
+        assert!(find_account_by_dir(&cfg, "/nowhere").is_none());
+        assert!(find_account_by_dir(&cfg, "").is_none());
     }
 
     fn cfg_of(accounts: Vec<Account>) -> Config {

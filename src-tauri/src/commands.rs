@@ -2,7 +2,7 @@ use crate::config::{
     apply_inherit_decisions, merge_inherit_overrides, Config, ConfigStore, InheritDecision,
 };
 use crate::paths::expand_tilde;
-use crate::{adapters, inherit, launcher, session};
+use crate::{adapters, inherit, launcher, session, tracking};
 use serde::Serialize;
 use std::collections::HashMap;
 use tauri::{AppHandle, Manager};
@@ -121,6 +121,7 @@ pub fn get_config(app: AppHandle) -> Result<Config, String> {
 pub fn save_config(app: AppHandle, config: Config) -> Result<(), String> {
     // Reject before taking the store lock: pure check, nothing to persist yet.
     crate::config::validate_unique_config_dirs(&config)?;
+    crate::tracking::validate_tracking(&config.tracking)?;
     // Preferences never edits inherit_overrides: keep whatever is on disk (a
     // tray-prompt decision may have landed since the UI loaded its copy).
     app.state::<ConfigStore>().update(|disk| {
@@ -164,7 +165,15 @@ pub fn launch_session(
     let cd = config_dir.to_string_lossy();
     let pp = project_path.to_string_lossy();
 
-    let script = launcher::build_script(adapter.kind, &cd, &pp);
+    // Tracking env carries secrets: only the temp script gets it, never the
+    // clipboard fallback below.
+    let tracking_env = tracking::tracking_env(
+        &cfg.tracking,
+        &account.id,
+        tracking::Origin::Tray,
+        &tracking::local_hostname(),
+    );
+    let script = launcher::build_script(adapter.kind, &cd, &pp, &tracking_env);
     let script_path = launcher::write_script(&script, adapter.kind).map_err(|e| e.to_string())?;
 
     adapters::spawn(&adapter, &script_path.to_string_lossy(), &pp).map_err(|e| {
@@ -225,14 +234,21 @@ fn run_account_action(
         ensure_account_inherits(app, account_id)?;
     }
 
+    // Only sessions report; secrets stay out of the clipboard fallbacks.
+    let tracking_env = tracking::tracking_env(
+        &cfg.tracking,
+        &account.id,
+        tracking::Origin::Tray,
+        &tracking::local_hostname(),
+    );
     let (script, fallback, what) = match action {
         AccountAction::Login => (
-            launcher::build_login_script(adapter.kind, &cd),
+            launcher::build_login_script(adapter.kind, &cd, &tracking_env),
             launcher::manual_login_command(adapter.kind, &cd),
             "login",
         ),
         AccountAction::Session => (
-            launcher::build_login_script(adapter.kind, &cd),
+            launcher::build_login_script(adapter.kind, &cd, &tracking_env),
             launcher::manual_login_command(adapter.kind, &cd),
             "the session",
         ),
@@ -370,7 +386,7 @@ mod launch_tests {
 
     #[test]
     fn test_should_build_session_script_from_account_and_project_dirs() {
-        let s = build_script(ScriptKind::Posix, "/home/u/.claude-dino", "/repo");
+        let s = build_script(ScriptKind::Posix, "/home/u/.claude-dino", "/repo", &[]);
         assert!(s.contains("CLAUDE_CONFIG_DIR='/home/u/.claude-dino'"));
         assert!(s.contains("cd '/repo'"));
     }

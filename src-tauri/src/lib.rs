@@ -6,6 +6,7 @@ pub mod inherit;
 pub mod launcher;
 pub mod paths;
 pub mod session;
+pub mod tracking;
 pub mod tray;
 pub mod usage;
 

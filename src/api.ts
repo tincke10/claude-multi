@@ -14,7 +14,23 @@ export type Account = {
   usage_limits: UsageLimits;
 };
 export type Project = { id: string; label: string; path: string; account: string };
-export type Config = { terminal: string; accounts: Account[]; projects: Project[] };
+// Opt-in session tracking. Edited by the Preferences Tracking section; until
+// that lands the UI just round-trips it untouched through the spreads in App.tsx.
+export type TrackingConfig = {
+  enabled: boolean;
+  ingest_url: string;
+  ingest_token: string;
+  grafana_otlp_endpoint: string;
+  grafana_instance_id: string;
+  grafana_token: string;
+  summaries: boolean;
+};
+export type Config = {
+  terminal: string;
+  accounts: Account[];
+  projects: Project[];
+  tracking: TrackingConfig;
+};
 export type TerminalInfo = { id: string; label: string };
 
 export type InheritStatus = "inherited" | "skipped" | "conflict" | "none";

@@ -103,7 +103,7 @@ fn run() -> Result<ExitCode, String> {
                 }
             }
 
-            exec_claude(account, &claude_args)
+            exec_claude(account, &cfg.tracking, &claude_args)
         }
     }
 }
@@ -111,12 +111,13 @@ fn run() -> Result<ExitCode, String> {
 #[cfg(unix)]
 fn exec_claude(
     account: &claude_multi_lib::config::Account,
+    tracking: &claude_multi_lib::config::TrackingConfig,
     claude_args: &[String],
 ) -> Result<ExitCode, String> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("claude");
     cmd.args(claude_args);
-    for (k, v) in launch_plan(account).env {
+    for (k, v) in launch_plan(account, tracking).env {
         cmd.env(k, v);
     }
     // exec only returns on failure.
@@ -126,11 +127,12 @@ fn exec_claude(
 #[cfg(not(unix))]
 fn exec_claude(
     account: &claude_multi_lib::config::Account,
+    tracking: &claude_multi_lib::config::TrackingConfig,
     claude_args: &[String],
 ) -> Result<ExitCode, String> {
     let mut cmd = std::process::Command::new("claude");
     cmd.args(claude_args);
-    for (k, v) in launch_plan(account).env {
+    for (k, v) in launch_plan(account, tracking).env {
         cmd.env(k, v);
     }
     let status = cmd

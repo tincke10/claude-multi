@@ -2,7 +2,8 @@
 //! and launch-plan assembly. No I/O — the bin (`src/bin/cms.rs`) owns all
 //! printing, process spawning, and filesystem access.
 
-use crate::config::Account;
+use crate::config::{Account, TrackingConfig};
+use crate::tracking::{local_hostname, tracking_env, Origin};
 
 /// What the `cms` invocation asks for. `Help { explicit }` distinguishes
 /// `cms --help` (exit 0) from `cms` with no args (usage error, exit != 0).
@@ -91,8 +92,9 @@ pub struct LaunchPlan {
 /// Builds the env for launching `claude` under `account`:
 /// `CLAUDE_CONFIG_DIR` first, then one entry per
 /// `launcher::PER_ACCOUNT_ENV_VARS` (`<config_dir>/<subdir>`), mirroring the
-/// tray's script builders.
-pub fn launch_plan(account: &Account) -> LaunchPlan {
+/// tray's script builders. When tracking is enabled its env follows, with
+/// origin `cms`; disabled adds nothing.
+pub fn launch_plan(account: &Account, tracking: &TrackingConfig) -> LaunchPlan {
     let dir = crate::paths::expand_tilde(&account.config_dir);
     let mut env = vec![(
         "CLAUDE_CONFIG_DIR".to_string(),
@@ -104,6 +106,12 @@ pub fn launch_plan(account: &Account) -> LaunchPlan {
             dir.join(subdir).to_string_lossy().into_owned(),
         ));
     }
+    env.extend(tracking_env(
+        tracking,
+        &account.id,
+        Origin::Cms,
+        &local_hostname(),
+    ));
     LaunchPlan { env }
 }
 
@@ -275,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_should_expand_tilde_when_building_launch_plan() {
-        let plan = launch_plan(&account("personal", "Personal"));
+        let plan = launch_plan(&account("personal", "Personal"), &TrackingConfig::default());
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap();
@@ -291,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_should_include_per_account_env_vars_when_building_launch_plan() {
-        let plan = launch_plan(&account("personal", "Personal"));
+        let plan = launch_plan(&account("personal", "Personal"), &TrackingConfig::default());
         let gh = plan
             .env
             .iter()
@@ -305,5 +313,47 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()
         );
+    }
+
+    use crate::config::TrackingConfig;
+
+    fn enabled_tracking() -> TrackingConfig {
+        TrackingConfig {
+            enabled: true,
+            ingest_url: "https://i.example.dev".into(),
+            ingest_token: "tok".into(),
+            ..TrackingConfig::default()
+        }
+    }
+
+    // R5.5 S11
+    #[test]
+    fn test_should_append_tracking_env_with_cms_origin_when_enabled() {
+        let plan = launch_plan(&account("personal", "Personal"), &enabled_tracking());
+        let get = |k: &str| {
+            plan.env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("CLAUDE_MULTI_ORIGIN").as_deref(), Some("cms"));
+        assert_eq!(get("CLAUDE_CODE_ENABLE_TELEMETRY").as_deref(), Some("1"));
+        assert!(get("OTEL_RESOURCE_ATTRIBUTES")
+            .unwrap()
+            .starts_with("cm.account=personal,cm.origin=cms"));
+        // Native env pair: the raw value, not shell-escaped text.
+        assert_eq!(
+            get("OTEL_EXPORTER_OTLP_LOGS_HEADERS").as_deref(),
+            Some("Authorization=Bearer%20tok")
+        );
+    }
+
+    #[test]
+    fn test_should_not_add_tracking_env_when_disabled() {
+        let plan = launch_plan(&account("personal", "Personal"), &TrackingConfig::default());
+        assert!(plan
+            .env
+            .iter()
+            .all(|(k, _)| k == "CLAUDE_CONFIG_DIR" || k == "GH_CONFIG_DIR"));
     }
 }
