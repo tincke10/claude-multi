@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cm-ingest",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  "triggers": { "crons": ["17 3 * * *"] },
+  "vars": {
+    "STALE_AFTER_HOURS": "6",
+    "GRAFANA_OTLP_LOGS_URL": ""
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cm-db",
+      // PLACEHOLDER: run `wrangler d1 create cm-db` (USER-ONLY) and paste the real id here.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../migrations"
+    }
+  ],
+  // Secrets are set with `wrangler secret put` (USER-ONLY), never in this file.
+  // GRAFANA_AUTH is optional and declared in src/env-extra.d.ts.
+  "secrets": { "required": ["INGEST_TOKEN"] }
+}

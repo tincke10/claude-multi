@@ -1,0 +1,21 @@
+{
+  "name": "cm-ingest",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "wrangler types --strict-vars=false && tsc --noEmit",
+    "types": "wrangler types --strict-vars=false",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@cm/core": "*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.0",
+    "@types/node": "^26.6.4",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.149.0"
+  }
+}
