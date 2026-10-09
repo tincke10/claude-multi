@@ -5,7 +5,12 @@
   margin-bottom: 18px;
   border-bottom: 1px solid var(--glass);
   overflow-x: auto;
+  /* The active underline sits 1px below the bar; without this it creates a
+     stray vertical scrollbar. The row still scrolls sideways when narrow. */
+  overflow-y: hidden;
+  scrollbar-width: none;
 }
+.tabs::-webkit-scrollbar { display: none; }
 .tabs__tab {
   position: relative;
   padding: 8px 0 11px;
@@ -288,6 +293,9 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+  /* Each room keeps its own height: an empty logged-out room must not stretch
+     to match a neighbour that shows usage. */
+  align-items: start;
 }
 .rooms__bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .rooms__title { font-size: 17px; font-weight: 700; margin: 0; }
