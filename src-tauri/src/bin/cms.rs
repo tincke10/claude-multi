@@ -11,7 +11,7 @@ use claude_multi_lib::{hook, hooks_install, inherit, paths, session, summary};
 use std::process::ExitCode;
 
 fn usage() -> String {
-    "Usage: cms <account> [claude args...]   launch claude here under <account>\n       cms --auto [claude args...]      pick the account from the current directory\n       cms --list | -l                  list configured accounts\n       cms --help | -h                  show this help\n\n<account> matches account id or label, case-insensitively, by unique prefix."
+    "Usage: cms <account> [claude args...]   launch claude here under <account>\n       cms --auto [claude args...]      pick the account from the current directory\n       cms --list | -l                  list configured accounts\n       cms --version | -V               print the cms version\n       cms --help | -h                  show this help\n\n<account> matches account id or label, case-insensitively, by unique prefix."
         .to_string()
 }
 
@@ -123,6 +123,10 @@ fn run() -> Result<ExitCode, String> {
                 eprintln!("{text}");
                 Ok(ExitCode::from(2))
             }
+        }
+        CliCommand::Version => {
+            println!("cms {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::SUCCESS)
         }
         CliCommand::List => {
             let cfg = load_config()?;
