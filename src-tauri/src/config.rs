@@ -57,6 +57,12 @@ pub struct Project {
     /// legacy/unassigned projects, which then appear under no account.
     #[serde(default)]
     pub account: String,
+    /// Extra folders whose subtree also belongs to this project (e.g. Orca's
+    /// `~/orca/workspaces/<project>`, where worktrees are created). Used by
+    /// `cms --auto` to map a working directory to an account. `~` is expanded
+    /// at match time. `#[serde(default)]` keeps legacy configs loading.
+    #[serde(default)]
+    pub worktree_roots: Vec<String>,
 }
 
 /// Calibrated token ceilings for an account's tray usage lines. There is no
@@ -824,6 +830,32 @@ mod tests {
         std::fs::write(&path, r#"{"terminal":"iterm","accounts":[],"projects":[]}"#).unwrap();
         let cfg = Config::try_load(&path).unwrap();
         assert_eq!(cfg.tracking, TrackingConfig::default());
+    }
+
+    #[test]
+    fn test_should_load_project_with_empty_worktree_roots_when_legacy_config_lacks_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[{"id":"p","label":"P","path":"/a","account":"x"}]}"#,
+        )
+        .unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert!(cfg.projects[0].worktree_roots.is_empty());
+    }
+
+    #[test]
+    fn test_should_round_trip_worktree_roots_when_saved_and_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[{"id":"p","label":"P","path":"/a","account":"x","worktree_roots":["~/w/p"]}]}"#,
+        )
+        .unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert_eq!(cfg.projects[0].worktree_roots, vec!["~/w/p".to_string()]);
     }
 
     #[test]

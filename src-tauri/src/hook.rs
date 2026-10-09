@@ -730,6 +730,7 @@ mod tests {
                 label: "My App".into(),
                 path: "/src/app".into(),
                 account: "work".into(),
+                worktree_roots: vec![],
             }],
             tracking: TrackingConfig {
                 enabled,

@@ -3,14 +3,15 @@
 //! fit). Edge I/O only; decision logic lives in `claude_multi_lib::cli`.
 
 use claude_multi_lib::cli::{
-    launch_plan, match_account, parse_cli_args, AccountMatchError, CliCommand,
+    launch_plan, match_account, parse_cli_args, resolve_account_for_cwd, AccountMatchError,
+    CliCommand,
 };
 use claude_multi_lib::config::Config;
 use claude_multi_lib::{hook, hooks_install, inherit, paths, session, summary};
 use std::process::ExitCode;
 
 fn usage() -> String {
-    "Usage: cms <account> [claude args...]   launch claude here under <account>\n       cms --list | -l                  list configured accounts\n       cms --help | -h                  show this help\n\n<account> matches account id or label, case-insensitively, by unique prefix."
+    "Usage: cms <account> [claude args...]   launch claude here under <account>\n       cms --auto [claude args...]      pick the account from the current directory\n       cms --list | -l                  list configured accounts\n       cms --help | -h                  show this help\n\n<account> matches account id or label, case-insensitively, by unique prefix."
         .to_string()
 }
 
@@ -40,6 +41,56 @@ fn load_config() -> Result<Config, String> {
     // `personal` account, or the CLI would create ~/.claude-personal state
     // the user never configured (see spec).
     Config::try_load(&path).map_err(|e| format!("could not read {}: {e}", path.display()))
+}
+
+/// The shared launch path for `cms <account>` and `cms --auto`: session gate,
+/// inherit/seed, tracking hooks sync, then exec `claude` with the account env.
+fn launch_under(
+    cfg: &Config,
+    account: &claude_multi_lib::config::Account,
+    claude_args: &[String],
+) -> Result<ExitCode, String> {
+    session::ensure_session_usable(account)?;
+
+    // Same inherit pass as the tray launch; the CLI never opens a GUI
+    // prompt and never persists decisions — undecided conflicts are
+    // skipped for this launch and resolved from the tray.
+    let source = paths::expand_tilde("~/.claude");
+    if source.is_dir() {
+        let config_dir = paths::expand_tilde(&account.config_dir);
+        match inherit::seed_and_apply(&source, &config_dir, &account.inherit_overrides) {
+            Ok(outcome) => {
+                if let Some(e) = outcome.seed_error {
+                    eprintln!("warning: settings.json seed failed: {e}");
+                }
+                for sub in &outcome.needs_prompt {
+                    eprintln!(
+                        "warning: '{sub}' has a conflict with ~/.claude and no saved decision; launching without inheriting it. Launch once from the tray to resolve."
+                    );
+                }
+            }
+            Err(e) => {
+                if let Some(s) = e.seed_error {
+                    eprintln!("warning: settings.json seed failed: {s}");
+                }
+                return Err(format!("inheriting ~/.claude failed: {}", e.inherit_error));
+            }
+        }
+    }
+
+    // Tracking hooks for this account. KeepExisting: never rewrite an
+    // entry the tray installed. Best-effort, and a no-op when tracking
+    // is off (the tray removes hooks on toggle).
+    if cfg.tracking.enabled {
+        let dir = paths::expand_tilde(&account.config_dir);
+        if let Err(e) =
+            hooks_install::sync_account(&dir, true, hooks_install::HookPolicy::KeepExisting)
+        {
+            eprintln!("warning: tracking hooks not installed: {e}");
+        }
+    }
+
+    exec_claude(account, &cfg.tracking, claude_args)
 }
 
 fn run() -> Result<ExitCode, String> {
@@ -78,6 +129,14 @@ fn run() -> Result<ExitCode, String> {
             println!("{}", account_list(&cfg));
             Ok(ExitCode::SUCCESS)
         }
+        CliCommand::Auto { claude_args } => {
+            // Not a hook: errors must be visible (main prints them, exit != 0).
+            let cfg = load_config()?;
+            let cwd = std::env::current_dir()
+                .map_err(|e| format!("could not read the current directory: {e}"))?;
+            let account = resolve_account_for_cwd(&cfg, &cwd).map_err(|e| e.to_string())?;
+            launch_under(&cfg, account, &claude_args)
+        }
         CliCommand::Launch { query, claude_args } => {
             let cfg = load_config()?;
             let account = match_account(&cfg.accounts, &query).map_err(|e| {
@@ -90,47 +149,7 @@ fn run() -> Result<ExitCode, String> {
                 format!("{reason}. Available accounts:\n{}", account_list(&cfg))
             })?;
 
-            session::ensure_session_usable(account)?;
-
-            // Same inherit pass as the tray launch; the CLI never opens a GUI
-            // prompt and never persists decisions — undecided conflicts are
-            // skipped for this launch and resolved from the tray.
-            let source = paths::expand_tilde("~/.claude");
-            if source.is_dir() {
-                let config_dir = paths::expand_tilde(&account.config_dir);
-                match inherit::seed_and_apply(&source, &config_dir, &account.inherit_overrides) {
-                    Ok(outcome) => {
-                        if let Some(e) = outcome.seed_error {
-                            eprintln!("warning: settings.json seed failed: {e}");
-                        }
-                        for sub in &outcome.needs_prompt {
-                            eprintln!(
-                                "warning: '{sub}' has a conflict with ~/.claude and no saved decision; launching without inheriting it. Launch once from the tray to resolve."
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(s) = e.seed_error {
-                            eprintln!("warning: settings.json seed failed: {s}");
-                        }
-                        return Err(format!("inheriting ~/.claude failed: {}", e.inherit_error));
-                    }
-                }
-            }
-
-            // Tracking hooks for this account. KeepExisting: never rewrite an
-            // entry the tray installed. Best-effort, and a no-op when tracking
-            // is off (the tray removes hooks on toggle).
-            if cfg.tracking.enabled {
-                let dir = paths::expand_tilde(&account.config_dir);
-                if let Err(e) =
-                    hooks_install::sync_account(&dir, true, hooks_install::HookPolicy::KeepExisting)
-                {
-                    eprintln!("warning: tracking hooks not installed: {e}");
-                }
-            }
-
-            exec_claude(account, &cfg.tracking, &claude_args)
+            launch_under(&cfg, account, &claude_args)
         }
     }
 }

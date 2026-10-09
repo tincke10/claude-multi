@@ -2,8 +2,9 @@
 //! and launch-plan assembly. No I/O — the bin (`src/bin/cms.rs`) owns all
 //! printing, process spawning, and filesystem access.
 
-use crate::config::{Account, TrackingConfig};
+use crate::config::{Account, Config, Project, TrackingConfig};
 use crate::tracking::{local_hostname, tracking_env, Origin};
+use std::path::{Component, Path, PathBuf};
 
 /// What the `cms` invocation asks for. `Help { explicit }` distinguishes
 /// `cms --help` (exit 0) from `cms` with no args (usage error, exit != 0).
@@ -21,6 +22,12 @@ pub enum CliCommand {
     /// Flag form on purpose, so an account named `hook` still launches.
     Hook {
         phase: HookPhase,
+    },
+    /// `cms --auto [claude args...]`: pick the account from the working
+    /// directory (project path / worktree roots), then launch like
+    /// `cms <account>`. Flag form so an account named `auto` still launches.
+    Auto {
+        claude_args: Vec<String>,
     },
     /// Internal: `cms --summarize <job-file>`, the detached summary worker
     /// re-exec'd by `--hook end`. Not listed in the usage text.
@@ -82,6 +89,158 @@ pub fn match_account<'a>(
     }
 }
 
+/// Why `cms --auto` could not pick an account for a directory.
+#[derive(Debug, PartialEq)]
+pub enum AutoResolveError {
+    /// No project path / worktree root contains the directory.
+    NoMatch {
+        cwd: PathBuf,
+        /// `(id, label)` of every configured account, for the message.
+        accounts: Vec<(String, String)>,
+    },
+    /// Equally specific candidates of different projects map to different accounts.
+    Ambiguous { cwd: PathBuf, accounts: Vec<String> },
+    /// The matching project has no account assigned.
+    UnassignedProject { project: String },
+    /// The matching project references an account that no longer exists.
+    UnknownAccount { project: String, account: String },
+}
+
+impl std::fmt::Display for AutoResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AutoResolveError::NoMatch { cwd, accounts } => {
+                writeln!(
+                    f,
+                    "no project maps the current directory ({}). Configured accounts:",
+                    cwd.display()
+                )?;
+                for (id, label) in accounts {
+                    writeln!(f, "  {id:<12} {label}")?;
+                }
+                write!(
+                    f,
+                    "Map this folder in Preferences: add it as a project path or as a worktree root of a project."
+                )
+            }
+            AutoResolveError::Ambiguous { cwd, accounts } => write!(
+                f,
+                "the current directory ({}) matches projects of different accounts ({}). Make one mapping more specific in Preferences.",
+                cwd.display(),
+                accounts.join(", ")
+            ),
+            AutoResolveError::UnassignedProject { project } => write!(
+                f,
+                "project '{project}' matches the current directory but has no account. Assign one in Preferences."
+            ),
+            AutoResolveError::UnknownAccount { project, account } => write!(
+                f,
+                "project '{project}' is assigned to unknown account '{account}'. Fix it in Preferences."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AutoResolveError {}
+
+/// Lexical normalization: drops `.`, folds `..` against the previous normal
+/// component, ignores trailing separators (components never yield them).
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(c);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// If `cwd` is `candidate` or inside it (by path components, never by string
+/// prefix), returns the candidate's normalized component count. Symlinks are
+/// resolved via `canonicalize` only when BOTH paths exist; otherwise the
+/// comparison stays lexical.
+fn match_depth(cwd: &Path, candidate: &Path) -> Option<usize> {
+    let (cwd_n, cand_n) = match (std::fs::canonicalize(cwd), std::fs::canonicalize(candidate)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => (normalize_lexical(cwd), normalize_lexical(candidate)),
+    };
+    if cand_n.as_os_str().is_empty() {
+        return None;
+    }
+    cwd_n
+        .starts_with(&cand_n)
+        .then(|| cand_n.components().count())
+}
+
+/// Maps a working directory to an account via the configured projects. Each
+/// project contributes its `path` and every `worktree_roots` entry (tilde
+/// expanded, blanks ignored). The longest matching candidate wins; equally
+/// long candidates must agree on the account.
+pub fn resolve_account_for_cwd<'a>(
+    cfg: &'a Config,
+    cwd: &Path,
+) -> Result<&'a Account, AutoResolveError> {
+    let mut best: Vec<&Project> = Vec::new();
+    let mut best_depth = 0usize;
+    for project in &cfg.projects {
+        let depth = std::iter::once(project.path.as_str())
+            .chain(project.worktree_roots.iter().map(String::as_str))
+            .filter(|c| !c.trim().is_empty())
+            .filter_map(|c| match_depth(cwd, &crate::paths::expand_tilde(c.trim())))
+            .max();
+        let Some(depth) = depth else { continue };
+        if depth > best_depth {
+            best_depth = depth;
+            best.clear();
+        }
+        if depth == best_depth {
+            best.push(project);
+        }
+    }
+    if best.is_empty() {
+        return Err(AutoResolveError::NoMatch {
+            cwd: cwd.to_path_buf(),
+            accounts: cfg
+                .accounts
+                .iter()
+                .map(|a| (a.id.clone(), a.label.clone()))
+                .collect(),
+        });
+    }
+    let mut resolved: Vec<&Account> = Vec::new();
+    for project in best {
+        if project.account.trim().is_empty() {
+            return Err(AutoResolveError::UnassignedProject {
+                project: project.label.clone(),
+            });
+        }
+        let account = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == project.account)
+            .ok_or_else(|| AutoResolveError::UnknownAccount {
+                project: project.label.clone(),
+                account: project.account.clone(),
+            })?;
+        if !resolved.iter().any(|a| a.id == account.id) {
+            resolved.push(account);
+        }
+    }
+    if resolved.len() > 1 {
+        return Err(AutoResolveError::Ambiguous {
+            cwd: cwd.to_path_buf(),
+            accounts: resolved.iter().map(|a| a.id.clone()).collect(),
+        });
+    }
+    Ok(resolved[0])
+}
+
 /// Parses `cms` args (without the program name). The first arg selects the
 /// command; everything after an account query passes through to `claude`
 /// verbatim, in order. `--list`/`--help` take no extra args, and an unknown
@@ -99,6 +258,9 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 phase: HookPhase::End,
             },
             _ => CliCommand::Help { explicit: false },
+        },
+        Some("--auto") => CliCommand::Auto {
+            claude_args: args[1..].to_vec(),
         },
         Some("--summarize") if args.len() == 2 => CliCommand::Summarize {
             job: std::path::PathBuf::from(&args[1]),
@@ -444,5 +606,263 @@ mod tests {
             .env
             .iter()
             .all(|(k, _)| k == "CLAUDE_CONFIG_DIR" || k == "GH_CONFIG_DIR"));
+    }
+
+    // ---- --auto parsing ----
+
+    #[test]
+    fn test_should_parse_auto_with_no_args_when_bare_auto_flag() {
+        assert_eq!(
+            parse_cli_args(&args(&["--auto"])),
+            CliCommand::Auto {
+                claude_args: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_pass_claude_args_through_verbatim_when_auto_has_trailing_args() {
+        assert_eq!(
+            parse_cli_args(&args(&[
+                "--auto",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "x",
+                "--auto",
+                "-p",
+                "a b"
+            ])),
+            CliCommand::Auto {
+                claude_args: args(&[
+                    "--dangerously-skip-permissions",
+                    "--resume",
+                    "x",
+                    "--auto",
+                    "-p",
+                    "a b"
+                ])
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_launch_account_named_auto_when_no_flag_dashes() {
+        assert_eq!(
+            parse_cli_args(&args(&["auto", "--resume"])),
+            CliCommand::Launch {
+                query: "auto".to_string(),
+                claude_args: args(&["--resume"]),
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_not_treat_auto_as_auto_when_not_first_arg() {
+        assert_eq!(
+            parse_cli_args(&args(&["dino", "--auto"])),
+            CliCommand::Launch {
+                query: "dino".to_string(),
+                claude_args: args(&["--auto"]),
+            }
+        );
+    }
+
+    // ---- resolve_account_for_cwd ----
+
+    fn project(id: &str, path: &str, roots: &[&str], account: &str) -> Project {
+        Project {
+            id: id.to_string(),
+            label: id.to_string(),
+            path: path.to_string(),
+            account: account.to_string(),
+            worktree_roots: roots.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn cfg_with(projects: Vec<Project>) -> Config {
+        Config {
+            accounts: fixture_accounts(),
+            projects,
+            ..Config::default()
+        }
+    }
+
+    fn resolved_id(cfg: &Config, cwd: &str) -> Result<String, AutoResolveError> {
+        resolve_account_for_cwd(cfg, Path::new(cwd)).map(|a| a.id.clone())
+    }
+
+    #[test]
+    fn test_should_resolve_account_when_cwd_equals_project_path() {
+        let cfg = cfg_with(vec![project("p", "/w/proj", &[], "a1")]);
+        assert_eq!(resolved_id(&cfg, "/w/proj").unwrap(), "a1");
+    }
+
+    #[test]
+    fn test_should_resolve_account_when_cwd_is_inside_project_path() {
+        let cfg = cfg_with(vec![project("p", "/w/proj", &[], "a1")]);
+        assert_eq!(resolved_id(&cfg, "/w/proj/src/deep").unwrap(), "a1");
+    }
+
+    #[test]
+    fn test_should_resolve_account_when_cwd_is_inside_worktree_root() {
+        let cfg = cfg_with(vec![project(
+            "p",
+            "/repos/proj",
+            &["/orca/ws/proj"],
+            "personal",
+        )]);
+        assert_eq!(
+            resolved_id(&cfg, "/orca/ws/proj/wt-1/src").unwrap(),
+            "personal"
+        );
+    }
+
+    #[test]
+    fn test_should_not_match_when_cwd_only_shares_a_string_prefix() {
+        let cfg = cfg_with(vec![project("p", "/a/foo", &[], "a1")]);
+        assert!(matches!(
+            resolved_id(&cfg, "/a/foobar"),
+            Err(AutoResolveError::NoMatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_should_pick_longest_candidate_when_several_match() {
+        let cfg = cfg_with(vec![
+            project("outer", "/w", &[], "personal"),
+            project("inner", "/w/client", &[], "a1"),
+        ]);
+        assert_eq!(resolved_id(&cfg, "/w/client/repo").unwrap(), "a1");
+        assert_eq!(resolved_id(&cfg, "/w/other").unwrap(), "personal");
+    }
+
+    #[test]
+    fn test_should_error_ambiguous_when_same_length_candidates_map_to_different_accounts() {
+        let cfg = cfg_with(vec![
+            project("p1", "/w/x", &[], "personal"),
+            project("p2", "/w/x", &[], "a1"),
+        ]);
+        assert!(matches!(
+            resolved_id(&cfg, "/w/x/y"),
+            Err(AutoResolveError::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn test_should_resolve_when_same_length_candidates_map_to_same_account() {
+        let cfg = cfg_with(vec![
+            project("p1", "/w/x", &[], "a1"),
+            project("p2", "/w/x", &[], "a1"),
+        ]);
+        assert_eq!(resolved_id(&cfg, "/w/x").unwrap(), "a1");
+    }
+
+    #[test]
+    fn test_should_error_when_matching_project_has_empty_account() {
+        let cfg = cfg_with(vec![project("p", "/w/x", &[], "")]);
+        assert!(matches!(
+            resolved_id(&cfg, "/w/x"),
+            Err(AutoResolveError::UnassignedProject { .. })
+        ));
+    }
+
+    #[test]
+    fn test_should_error_when_matching_project_has_unknown_account() {
+        let cfg = cfg_with(vec![project("p", "/w/x", &[], "ghost")]);
+        assert!(matches!(
+            resolved_id(&cfg, "/w/x"),
+            Err(AutoResolveError::UnknownAccount { .. })
+        ));
+    }
+
+    #[test]
+    fn test_should_list_accounts_and_hint_preferences_when_no_match() {
+        let cfg = cfg_with(vec![project("p", "/w/x", &[], "a1")]);
+        let msg = resolve_account_for_cwd(&cfg, Path::new("/elsewhere"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("/elsewhere"), "{msg}");
+        assert!(
+            msg.contains("personal") && msg.contains("Personal"),
+            "{msg}"
+        );
+        assert!(msg.contains("a1") && msg.contains("Dinocloud"), "{msg}");
+        assert!(msg.contains("Preferences"), "{msg}");
+        assert!(msg.contains("worktree root"), "{msg}");
+    }
+
+    #[test]
+    fn test_should_ignore_empty_candidates_when_path_or_root_blank() {
+        let cfg = cfg_with(vec![project("p", "", &["", "  "], "a1")]);
+        assert!(matches!(
+            resolved_id(&cfg, "/anything"),
+            Err(AutoResolveError::NoMatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_should_normalize_trailing_slash_and_dot_segments_when_comparing_lexically() {
+        let cfg = cfg_with(vec![project(
+            "p",
+            "/w/proj/",
+            &["/o/./ws/../ws/proj//"],
+            "a1",
+        )]);
+        assert_eq!(resolved_id(&cfg, "/w/proj").unwrap(), "a1");
+        assert_eq!(resolved_id(&cfg, "/o/ws/proj/wt/../wt2").unwrap(), "a1");
+        assert!(resolved_id(&cfg, "/w/proj/../other").is_err());
+    }
+
+    #[test]
+    fn test_should_expand_tilde_when_candidate_starts_with_home() {
+        let home = std::env::var("HOME").unwrap();
+        let cfg = cfg_with(vec![project(
+            "p",
+            "~/orca/workspaces/zzz-nonexistent",
+            &[],
+            "a1",
+        )]);
+        let cwd = format!("{home}/orca/workspaces/zzz-nonexistent/wt");
+        assert_eq!(resolved_id(&cfg, &cwd).unwrap(), "a1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_match_through_symlink_when_both_paths_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("proj/sub")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Project configured via the symlink, cwd reported as the real path.
+        let cfg = cfg_with(vec![project(
+            "p",
+            link.join("proj").to_str().unwrap(),
+            &[],
+            "a1",
+        )]);
+        let cwd: PathBuf = real.join("proj/sub");
+        assert_eq!(resolve_account_for_cwd(&cfg, &cwd).unwrap().id, "a1");
+    }
+
+    #[test]
+    fn test_should_fall_back_to_lexical_when_paths_do_not_exist() {
+        let cfg = cfg_with(vec![project("p", "/no/such/dir", &[], "a1")]);
+        assert_eq!(resolved_id(&cfg, "/no/such/dir/child").unwrap(), "a1");
+    }
+
+    #[test]
+    fn test_should_match_canonical_temp_dir_when_both_exist() {
+        // macOS: temp dirs live under /var -> /private/var; canonicalizing both
+        // sides must keep equal paths matching.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("wt")).unwrap();
+        let canonical_cwd = std::fs::canonicalize(proj.join("wt")).unwrap();
+        let cfg = cfg_with(vec![project("p", proj.to_str().unwrap(), &[], "a1")]);
+        assert_eq!(
+            resolve_account_for_cwd(&cfg, &canonical_cwd).unwrap().id,
+            "a1"
+        );
     }
 }
