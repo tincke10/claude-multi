@@ -243,7 +243,10 @@ jobs:
           # releaseId (instead of tagName/releaseName) is what keeps the
           # concurrent matrix jobs from each creating their own draft.
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          args: ${{ matrix.args }}
+          # The overlay adds the `cms` sidecar (externalBin) and builds it via
+          # scripts/build-sidecar.mjs; it is kept out of tauri.conf.json so
+          # `cargo test`/`clippy` don't need the staged binary.
+          args: --config src-tauri/tauri.bundle.conf.json ${{ matrix.args }}
 
       # v0.6.0 shipped a bundle whose only executable was the `cms` CLI — with
       # two bin targets the bundler picked the wrong one, and every job still
@@ -265,5 +268,22 @@ jobs:
           fi
           if ! otool -L "$APP/Contents/MacOS/$EXEC" | grep -q WebKit.framework; then
             echo "bundled '$EXEC' does not link WebKit — it is not the tray app" >&2
+            exit 1
+          fi
+          # The cms sidecar must sit next to the app (Tauri strips the target
+          # triple), be executable, be a different binary than the app, and
+          # target the same architecture. (It also links WebKit, because the
+          # shared lib pulls in tauri, so WebKit cannot tell the two apart.)
+          CMS="$APP/Contents/MacOS/cms"
+          if [ ! -x "$CMS" ]; then
+            echo "sidecar 'cms' is missing or not executable in $APP/Contents/MacOS" >&2
+            exit 1
+          fi
+          if cmp -s "$CMS" "$APP/Contents/MacOS/$EXEC"; then
+            echo "bundled 'cms' is identical to '$EXEC' — wrong sidecar" >&2
+            exit 1
+          fi
+          if [ "$(lipo -archs "$CMS")" != "$(lipo -archs "$APP/Contents/MacOS/$EXEC")" ]; then
+            echo "bundled 'cms' architecture differs from '$EXEC'" >&2
             exit 1
           fi

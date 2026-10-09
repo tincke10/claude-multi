@@ -27,3 +27,6 @@ dist-ssr
 
 # Local Claude Code agent state
 .claude/
+
+# Tauri sidecar staged by scripts/build-sidecar.mjs
+src-tauri/binaries/
