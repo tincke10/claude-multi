@@ -276,6 +276,37 @@ missing project path (see step 15).
 
 ---
 
+## Orca integration (macOS, Orca installed)
+
+Never point these at real work you care about: step 3 opens a real Orca terminal.
+
+- [ ] `cms --version` prints `cms <version>` matching Preferences' app version.
+- [ ] **Health panel** (MANUAL 3.5): Preferences -> Orca -> **Check** shows rows
+      for cms on PATH, same binary, agent command, managed accounts, unmapped
+      repos, data source. Quit Orca and Check again: the panel still renders,
+      with Orca-dependent rows as "unavailable" warnings (not failures) and the
+      data source reported as the SQLite snapshot.
+- [ ] **Import dry run** (MANUAL 4.5): **Import from Orca...** lists candidates
+      with sensible worktree roots; already-mapped repos are disabled. Import
+      into a scratch config (or one repo, then discard with Save left unpressed
+      / remove it). Verify Orca's data dir is untouched: `Library/Application
+      Support/orca/` mtimes do not change because of the dialog.
+- [ ] **Open in Orca** (MANUAL 5.7), with Orca running: tray -> account -> Open
+      in Orca -> project. A focused Orca terminal opens running `cms <account>`
+      (`echo $CLAUDE_CONFIG_DIR` in Claude Code `/status` shows that account).
+      Repeat with (a) a project whose path IS an Orca repo, and (b) one under a
+      worktree root / `.nosync` symlink; confirm Orca's `path:` selector accepts
+      it, or that the dialog shows the "must be an Orca repo or worktree" hint.
+- [ ] Same with Orca fully quit: Orca launches, then the terminal opens
+      (a "didn't become ready" dialog is acceptable if Orca takes longer than 3 s;
+      retry works).
+- [ ] The tray stays responsive while Orca starts (no beachball).
+- [ ] With Orca not installed (rename the app temporarily): no Orca card, no
+      "Open in Orca" submenu, no errors.
+- [ ] Fixtures/docs contain no real project names or personal paths.
+
+---
+
 ## Release artifacts (before publishing a draft)
 
 The `v0.6.0` draft shipped a `.app` whose only executable was the `cms` CLI —
