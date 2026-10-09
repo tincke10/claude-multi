@@ -7,6 +7,7 @@ import {
   getConfig, saveConfig, listTerminals, getInheritStatus, setInheritDecision, testTrackingConnection,
 } from "./api";
 import { trackingProblem } from "./tracking";
+import { parseWorktreeRoots, formatWorktreeRoots, worktreeRootsProblem } from "./worktreeRoots";
 import "./App.css";
 
 // Account config dirs always live under `~/.claude-<suffix>` so they stay
@@ -63,6 +64,8 @@ export default function App() {
   const [check, setCheck] = useState<TrackingCheck | null>(null);
   const [checking, setChecking] = useState(false);
   const [checkErr, setCheckErr] = useState<string | null>(null);
+  // Raw worktree-roots text per project id (see `setRoots`).
+  const [rootsDrafts, setRootsDrafts] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!IN_TAURI) {
@@ -77,9 +80,12 @@ export default function App() {
         // first account so they aren't silently invisible in the tray.
         const validIds = new Set(cfg.accounts.map((a) => a.id));
         const firstId = cfg.accounts[0]?.id ?? "";
-        const projects = cfg.projects.map((p) =>
-          validIds.has(p.account) ? p : { ...p, account: firstId }
-        );
+        // Legacy projects may predate worktree_roots; default it so the input binds.
+        const projects = cfg.projects.map((p) => ({
+          ...p,
+          worktree_roots: p.worktree_roots ?? [],
+          account: validIds.has(p.account) ? p.account : firstId,
+        }));
         // Legacy accounts may predate usage_limits; default it so the inputs bind.
         const accounts = cfg.accounts.map((a) => ({
           ...a,
@@ -146,6 +152,15 @@ export default function App() {
     setCheckErr(null);
   };
   const trackingErr = trackingProblem(cfg.tracking);
+  // Worktree-roots drafts: the textarea keeps the raw text (a trailing comma
+  // must survive typing) while the config holds the parsed list.
+  const rootsDraft = (p: Project) => rootsDrafts[p.id] ?? formatWorktreeRoots(p.worktree_roots);
+  const rootsErrors = cfg.projects.map((p) => worktreeRootsProblem(p.worktree_roots));
+  const hasRootsErr = rootsErrors.some((e) => e !== null);
+  const setRoots = (i: number, raw: string) => {
+    setRootsDrafts({ ...rootsDrafts, [cfg.projects[i].id]: raw });
+    setProjects(updateAt(cfg.projects, i, { worktree_roots: parseWorktreeRoots(raw) }));
+  };
   const canTest = cfg.tracking.ingest_url.trim() !== "" && cfg.tracking.ingest_token !== "";
   // Patch one account's usage ceilings immutably.
   const setAccountLimits = (i: number, u: Partial<UsageLimits>) =>
@@ -171,7 +186,7 @@ export default function App() {
 
   const addProject = () => {
     const id = nextId(cfg.projects.map((p) => p.id), "p");
-    setProjects([...cfg.projects, { id, label: "", path: "", account: cfg.accounts[0]?.id ?? "" }]);
+    setProjects([...cfg.projects, { id, label: "", path: "", account: cfg.accounts[0]?.id ?? "", worktree_roots: [] }]);
   };
 
   const browseProject = async (i: number) => {
@@ -380,7 +395,8 @@ export default function App() {
 
         {cfg.projects.length === 0 && <p className="muted">No projects yet. Add one and pick a folder.</p>}
         {cfg.projects.map((p, i) => (
-          <div className="row" key={p.id}>
+          <div className="project" key={p.id}>
+          <div className="row">
             <input
               className="input row__label"
               placeholder="Label"
@@ -409,6 +425,15 @@ export default function App() {
               title="Remove project"
               onClick={() => setProjects(cfg.projects.filter((_, j) => j !== i))}
             >✕</button>
+          </div>
+          <textarea
+            className="input project__roots"
+            rows={2}
+            placeholder="Worktree roots (optional) — e.g. ~/orca/workspaces/my-project, one per line or comma-separated"
+            value={rootsDraft(p)}
+            onChange={(e) => setRoots(i, e.target.value)}
+          />
+          {rootsErrors[i] && <p className="field-error">{rootsErrors[i]}</p>}
           </div>
         ))}
       </section>
@@ -527,11 +552,14 @@ export default function App() {
       </section>
 
       <footer className="app__footer">
-        <button className="btn btn--primary" onClick={save} disabled={dupDirs.size > 0 || trackingErr !== null}>Save</button>
+        <button className="btn btn--primary" onClick={save} disabled={dupDirs.size > 0 || trackingErr !== null || hasRootsErr}>Save</button>
         {dupDirs.size > 0 && (
           <span className="status status--err">Fix the duplicate account config directories to save.</span>
         )}
-        {trackingErr && dupDirs.size === 0 && (
+        {hasRootsErr && dupDirs.size === 0 && (
+          <span className="status status--err">Fix the worktree roots to save.</span>
+        )}
+        {trackingErr && dupDirs.size === 0 && !hasRootsErr && (
           <span className="status status--err">Fix the Tracking settings to save.</span>
         )}
         {status && <span className={`status status--${status.kind}`}>{status.text}</span>}

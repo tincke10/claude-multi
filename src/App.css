@@ -100,6 +100,10 @@ body {
   margin-bottom: 8px;
 }
 .row:last-child { margin-bottom: 0; }
+.project { margin-bottom: 14px; }
+.project:last-child { margin-bottom: 0; }
+.project .row { margin-bottom: 6px; }
+.project__roots { width: 100%; box-sizing: border-box; resize: vertical; font-family: inherit; }
 .row__grow { flex: 1 1 auto; min-width: 0; }
 .row__label { flex: 0 0 130px; }
 

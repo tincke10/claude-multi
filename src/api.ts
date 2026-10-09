@@ -13,7 +13,11 @@ export type Account = {
   inherit_overrides: Partial<Record<string, InheritDecision>>;
   usage_limits: UsageLimits;
 };
-export type Project = { id: string; label: string; path: string; account: string };
+export type Project = {
+  id: string; label: string; path: string; account: string;
+  // Extra folders (e.g. Orca worktree parents) mapped to this project by `cms --auto`.
+  worktree_roots: string[];
+};
 // Opt-in session tracking, edited by the Preferences Tracking section. The
 // backend never sends the real tokens to the UI: a saved token arrives as
 // TOKEN_MASK, and sending TOKEN_MASK back on save means "keep the stored one".
