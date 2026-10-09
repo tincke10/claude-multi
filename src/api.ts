@@ -72,3 +72,16 @@ export const setInheritDecision = (
 
 export const testTrackingConnection = (tracking: TrackingConfig) =>
   invoke<TrackingCheck>("test_tracking_connection", { tracking });
+
+// Orca integration (macOS only). Everything Orca-related is read-only.
+export type HealthLevel = "pass" | "warn" | "fail" | "info" | "unknown";
+export type OrcaHealthCheck = {
+  id: string;
+  label: string;
+  level: HealthLevel;
+  detail: string;
+  hint: string | null;
+};
+// `supported` is false off macOS, where the Orca card is not shown at all.
+export type OrcaHealth = { supported: boolean; checks: OrcaHealthCheck[] };
+export const orcaHealth = () => invoke<OrcaHealth>("orca_health");

@@ -31,6 +31,7 @@ pub fn run() {
             commands::get_config,
             commands::save_config,
             commands::test_tracking_connection,
+            commands::orca_health,
             commands::list_terminals,
             commands::launch_session,
             commands::open_session,

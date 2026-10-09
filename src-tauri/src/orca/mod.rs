@@ -12,6 +12,8 @@ pub mod health;
 pub mod model;
 pub mod plan;
 #[cfg(target_os = "macos")]
+pub mod probe;
+#[cfg(target_os = "macos")]
 pub mod source;
 
 #[cfg(test)]

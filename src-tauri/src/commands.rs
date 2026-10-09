@@ -199,6 +199,29 @@ pub async fn test_tracking_connection(
     .map_err(|e| e.to_string())
 }
 
+/// Orca integration health for the Preferences panel. Read-only; runs on a
+/// blocking thread (login-shell probe + Orca CLI). Off macOS the whole
+/// integration is hidden (`supported: false`).
+#[tauri::command]
+pub async fn orca_health(app: AppHandle) -> Result<crate::orca::health::OrcaHealth, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Lock-free read: never hold the config lock across the probes.
+        let cfg = load_config(&app)?;
+        tauri::async_runtime::spawn_blocking(move || crate::orca::probe::health_system(&cfg))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(crate::orca::health::OrcaHealth {
+            supported: false,
+            checks: Vec::new(),
+        })
+    }
+}
+
 #[tauri::command]
 pub fn list_terminals() -> Vec<TerminalInfo> {
     adapters::builtin_adapters()

@@ -6,6 +6,7 @@ import {
   TrackingConfig, TrackingCheck,
   getConfig, saveConfig, listTerminals, getInheritStatus, setInheritDecision, testTrackingConnection,
 } from "./api";
+import OrcaPanel from "./OrcaPanel";
 import { trackingProblem } from "./tracking";
 import { parseWorktreeRoots, formatWorktreeRoots, worktreeRootsProblem } from "./worktreeRoots";
 import "./App.css";
@@ -437,6 +438,8 @@ export default function App() {
           </div>
         ))}
       </section>
+
+      {IN_TAURI && <OrcaPanel />}
 
       <section className="card">
         <div className="card__head">

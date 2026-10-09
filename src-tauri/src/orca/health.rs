@@ -29,6 +29,14 @@ pub struct HealthCheck {
     pub hint: Option<String>,
 }
 
+/// What the `orca_health` command returns. `supported` is false off macOS,
+/// where the whole Orca integration is hidden.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrcaHealth {
+    pub supported: bool,
+    pub checks: Vec<HealthCheck>,
+}
+
 /// Everything the checks need, gathered at the edge.
 #[derive(Debug, Clone)]
 pub struct HealthInputs {
@@ -407,6 +415,25 @@ mod tests {
 
     fn settings() -> OrcaSettings {
         OrcaSettings::default()
+    }
+
+    #[test]
+    fn test_should_serialize_health_with_lowercase_levels_when_sent_to_the_ui() {
+        let h = OrcaHealth {
+            supported: true,
+            checks: evaluate(
+                &HealthInputs {
+                    orca_installed: false,
+                    ..inputs(None)
+                },
+                &config(vec![]),
+            ),
+        };
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["supported"], true);
+        assert_eq!(v["checks"][0]["id"], "orca_installed");
+        assert_eq!(v["checks"][0]["level"], "info");
+        assert!(v["checks"][0]["hint"].is_null());
     }
 
     #[test]
