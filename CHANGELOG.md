@@ -8,6 +8,30 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Tabbed Preferences**: Accounts, Projects (with Inheritance), Tracking, Orca
+  (only when Orca is installed) and Settings. Edits survive tab switches, one
+  **Save** applies everything, tabs with errors get a marker, and the last tab
+  is remembered.
+- **Sealed-rooms Accounts tab**: each account is a "room" with usage vessels
+  (Session 5h, Week 7d, plus one per model with the Account API), chips (plan
+  tier, pacing, source, freshness) and the login actions. Figtree and Bricolage
+  Grotesque are bundled, so the window renders offline
+  (`THIRD_PARTY_NOTICES.md`, SIL OFL 1.1).
+- **Real rate-limit usage from Claude Code's statusline** (on by default): each
+  account's `settings.json` runs `cms --statusline`, which records the 5h/7d
+  percentages to `<app data>/usage/<hash8>.json` (0600) and chains your own
+  statusline, which keeps rendering. Turning it off in Settings restores your
+  original `statusLine`. Data appears after the first reply of a session.
+- **Pacing and plan tier**: chips show whether you are on, over or under pace
+  for each window (within 5 points counts as on pace) and the plan (for example
+  Max 20x). Readings older than 30 minutes are marked stale.
+- **Opt-in Account API (off by default)**: Settings -> Account API reads
+  Anthropic's undocumented usage endpoint with your own OAuth token for exact
+  per-model limits (for example Fable) and the plan. A permanent warning covers
+  the risks (undocumented, terms grey area, shared rate limits, Keychain
+  prompt). The token is read-only and never stored or refreshed.
+- **Frontend tests**: Vitest (`npm test`) for the pure helpers.
+
 - **Accounts panel in Preferences**: each saved account shows its login status
   (logged in with email, session expired, not logged in), Login / Logout /
   Relogin buttons (via the configured terminal) and Session (5h) / Week (7d)
@@ -75,9 +99,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Preferences is split into tabs instead of one long page; the Accounts panel
+  became the room grid. Usage now prefers real numbers (Account API, then
+  statusline) over the local token estimate, which is shown only as a fallback.
+- The `settings.json` read-modify-write shared by the tracking hooks and the
+  statusline lives in one guarded module (default `~/.claude` and symlinks are
+  refused, malformed files are never overwritten).
+- `config.json` gains a `usage` section (`statusline_enabled` default true,
+  `endpoint_enabled` default false); older configs load unchanged.
 - `config.json` is saved with `0600` permissions on Unix.
 - CI: clippy and the test suite now also run on macOS and Windows, and gate the
   release builds.
+
+### Removed
+
+- The manual Session/Week token ceiling inputs in Preferences. The
+  `usage_limits` field stays in `config.json` and still drives the tray's
+  percentages.
 
 ## [0.6.0] — 2026-09-15
 

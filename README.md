@@ -86,6 +86,58 @@ Quit
 
 ---
 
+## Preferences
+
+**Preferences…** opens a tabbed window. Edits are kept while you switch tabs and a single **Save** applies all of them (disabled while any tab has an error; the footer names the first one). The window remembers the last tab you used.
+
+| Tab | What it has |
+|---|---|
+| **Accounts** | One "room" per account: login status, usage vessels (Session 5h, Week 7d, plus one vessel per model when the Account API is on), chips (plan tier, pacing, source, freshness) and the Log in / Log out / Log in again / refresh actions. Add, edit and remove accounts from the collapsible **Edit** inside each room. |
+| **Projects** | Projects (label, folder, owning account), plus the Inheritance panel for `~/.claude` resources. |
+| **Tracking** | Opt-in session tracking (see "Session tracking"). |
+| **Orca** | Orca health check and import. Only shown when Orca is installed. |
+| **Settings** | Terminal, the statusline toggle and the Account API switch (see "Real usage"). |
+
+The UI fonts (Figtree and Bricolage Grotesque) are bundled, so the window renders offline. Licenses are in `THIRD_PARTY_NOTICES.md`.
+
+The manual Session/Week token ceiling inputs were removed from Preferences. The `usage_limits` field is still kept in `config.json` and still drives the percentages shown in the tray menu.
+
+---
+
+## Real usage (rate limits)
+
+Each account room shows how much of your real Claude rate limits you have used. Per window, the first available source wins:
+
+1. **Account API** (only if you turned it on, see below), when its reading is less than 15 minutes old.
+2. **Statusline**: the values Claude Code itself reports. A reading whose reset time has already passed is dropped.
+3. **Local estimate**: tokens counted from local transcripts, shown as "1.2M tok · est." with no percentage.
+4. Otherwise "no data yet". A missing reading is never shown as 0%.
+
+Readings older than 30 minutes are flagged as stale, and the room shows their age ("Updated 5m ago"). A vessel turns amber from 60% and red from 85%.
+
+**Pacing chips** compare your usage with how much of the window has elapsed: "Session on pace" when you are within 5 points of the elapsed share, otherwise "Session N% over pace" or "under pace". They are hidden during the first 5% of a window, when the comparison is meaningless.
+
+### Statusline recording (on by default)
+
+Claude Code passes `rate_limits` (5-hour and 7-day used percentage and reset time) to the configured statusline command. For each account, claude-multi writes a `statusLine` entry into `<config_dir>/settings.json` that runs `cms --statusline`:
+
+- It records the numbers to `<app data>/usage/<hash8>.json` (`hash8` = first 8 hex chars of the SHA-256 of the account's config dir), file mode `0600`.
+- It **chains your existing statusline**: your original `statusLine` value is saved to `<config_dir>/.claude-multi-statusline.json` and run on every refresh (1.5 s timeout), so your own statusline keeps rendering. If it fails or times out, a fallback line (`model · 5h N% · 7d N%`) is printed. Chaining is Unix only for now; on Windows only the fallback line is printed.
+- **Uninstall restores** the original: turn off **Use the statusline to read real usage** in Settings and the original `statusLine` value is put back (or removed if you had none).
+- It never writes inside the default `~/.claude`, and refuses to write settings through a symlink.
+- It needs Claude Code to run the statusline: data appears only after the first reply of a session.
+- It is installed when an account is prepared for a launch or login from the tray, on `cms <account>` launches, and when you flip the toggle and Save.
+
+### Account API (off by default)
+
+**Settings -> Account API (advanced)** adds exact per-model limits (for example Fable) and your plan by calling Anthropic's usage endpoint with your own OAuth token. The Settings tab shows this warning permanently:
+
+> This API is undocumented, so it may break or start rate-limiting at any time. It sits in a grey area of Anthropic's terms: Claude Code's terms say developers may not collect, store or intermediate Claude.ai credentials or session tokens. Claude Multi only reads your own access token locally, in memory, and sends it to Anthropic's API alone. It never stores, refreshes or sends it anywhere else. The requests share rate limits with Claude Code, and macOS may ask for Keychain access.
+
+The token is read-only (Keychain on macOS, `.credentials.json` elsewhere) and never refreshed, logged or written. If it has expired, open Claude in that account to refresh it. Results are cached for 5 minutes per account, requests back off on 429, and only logged-in accounts are queried. With the switch off, no request is made and this token is never read.
+
+---
+
 ## Prerequisites
 
 | Tool | Minimum | Check |
@@ -137,8 +189,8 @@ This compiles the Rust backend and launches the app. A tray icon appears in the 
 
 ## First-run flow
 
-1. **Preferences…** → under **Accounts**, keep *Personal* and/or add accounts (label + a `~/.claude-<suffix>`).
-2. Add **Projects**: click **Browse…** to pick a folder (the label auto-fills), then assign each project to an account. **Save.**
+1. **Preferences…** → on the **Accounts** tab, keep *Personal* and/or add accounts (label + a `~/.claude-<suffix>`).
+2. On the **Projects** tab, add projects: click **Browse…** to pick a folder (the label auto-fills), then assign each project to an account. **Save.**
 3. **Login per account**: tray → *Account* → **Login…** → a terminal opens running `claude`; complete the browser OAuth once.
 4. **Launch**: tray → *Account* → *Project* (or **New session** for a project-less session).
 
@@ -270,6 +322,8 @@ owner-only) and flushed later; the hook always exits 0 and never blocks Claude C
 - The app **only** reads/writes the per-account `~/.claude-<suffix>` dirs you configure — **never** the default `~/.claude`.
 - Launch scripts shell-escape the config dir and project path (POSIX `'\''`, PowerShell `''`).
 - Temp scripts are created atomically with restrictive permissions and unguessable names (`tempfile`).
+- Statusline recording edits only the per-account `settings.json` (never through a symlink) and keeps your original statusline in a `0600` sidecar so it can be restored.
+- The Account API is opt-in. Its OAuth token is read-only: never refreshed, logged, serialized or sent anywhere but Anthropic's API.
 - With Tracking on, those scripts and the session environment carry the tracking tokens (see "Session tracking").
 
 ---
