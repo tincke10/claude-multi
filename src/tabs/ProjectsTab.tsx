@@ -85,7 +85,7 @@ export default function ProjectsTab({ config: cfg, patch, applyPersisted }: Prop
       <section className="card">
         <div className="card__head">
           <h2 className="card__title">Projects</h2>
-          <button className="btn btn--ghost" onClick={addProject} disabled={cfg.accounts.length === 0}>+ Add project</button>
+          <button className="btn btn--ghost" onClick={addProject} disabled={cfg.accounts.length === 0}>Add project</button>
         </div>
         <p className="card__hint">Each project belongs to one account and appears only under that account in the tray.</p>
 

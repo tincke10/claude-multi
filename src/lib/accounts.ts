@@ -31,10 +31,21 @@ export function actionsFor(status: AccountStatus): AuthAction[] {
 }
 
 export const ACTION_LABEL: Record<AuthAction, string> = {
-  login: "Login",
-  logout: "Logout",
-  relogin: "Relogin",
+  login: "Log in",
+  logout: "Log out",
+  relogin: "Log in again",
 };
+
+export type RoomVariant = "normal" | "expired" | "empty";
+
+// A logged-out account is an empty (dashed) room; an expired one keeps its data.
+export function roomVariant(status: AccountStatus): RoomVariant {
+  switch (status) {
+    case "logged_in": return "normal";
+    case "expired": return "expired";
+    case "logged_out": return "empty";
+  }
+}
 
 export function statusPill(o: AccountOverview): { text: string; tone: "ok" | "warn" | "off" } {
   switch (o.status) {

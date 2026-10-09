@@ -14,7 +14,6 @@ import ProjectsTab from "./tabs/ProjectsTab";
 import TrackingTab from "./tabs/TrackingTab";
 import OrcaTab from "./tabs/OrcaTab";
 import SettingsTab from "./tabs/SettingsTab";
-import "./App.css";
 
 const TAB_LABELS: Record<TabId, string> = {
   accounts: "Accounts",

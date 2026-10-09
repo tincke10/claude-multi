@@ -1,0 +1,45 @@
+/* Sealed rooms: deep teal glass. Dark-first; the light block is a functional
+   remap only (same roles, no extra polish). */
+:root {
+  color-scheme: dark;
+
+  --bg: #0f1719;
+  --room: #142024;
+  --glass: #2c4248;
+  --ink: #e3eeec;
+  --dim: #8aa3a2;
+  --fill: #5fb3c4;
+  --fill2: #9bd3c7;
+  --warn: #e6b34a;
+  --hot: #f0715b;
+
+  /* Roles derived from the palette. */
+  --on-fill: #08262c;
+  --input-bg: #0c1315;
+  --ok: var(--fill2);
+  --danger: var(--hot);
+
+  --font-ui: "Figtree Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Bricolage Grotesque Variable", var(--font-ui);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius-room: 16px;
+  --radius-ctl: 10px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #eef4f4;
+    --room: #ffffff;
+    --glass: #c3d3d3;
+    --ink: #12292d;
+    --dim: #4f6a6c;
+    --fill: #1f7f93;
+    --fill2: #176b5c;
+    --warn: #8f6200;
+    --hot: #b83a26;
+    --on-fill: #ffffff;
+    --input-bg: #f6fafa;
+  }
+}

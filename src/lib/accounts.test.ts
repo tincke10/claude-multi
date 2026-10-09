@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AccountOverview, UsageView } from "../api";
-import { actionsFor, humanTokens, isSaved, statusPill, usageText } from "./accounts";
+import { ACTION_LABEL, actionsFor, humanTokens, isSaved, roomVariant, statusPill, usageText } from "./accounts";
 
 const usage = (u: Partial<UsageView> = {}): UsageView => ({ used: 0, ceiling: null, percent: null, ...u });
 const overview = (o: Partial<AccountOverview> = {}): AccountOverview => ({
@@ -50,5 +50,19 @@ describe("isSaved", () => {
     expect(isSaved(overview(), "a1", "~/.claude-b")).toBe(false);
     expect(isSaved(overview(), "a2", "~/.claude-a")).toBe(false);
     expect(isSaved(undefined, "a1", "~/.claude-a")).toBe(false);
+  });
+});
+
+describe("roomVariant", () => {
+  it("test_should_map_status_to_room_variant", () => {
+    expect(roomVariant("logged_in")).toBe("normal");
+    expect(roomVariant("expired")).toBe("expired");
+    expect(roomVariant("logged_out")).toBe("empty");
+  });
+});
+
+describe("ACTION_LABEL", () => {
+  it("test_should_use_sentence_case_labels", () => {
+    expect(ACTION_LABEL).toEqual({ login: "Log in", logout: "Log out", relogin: "Log in again" });
   });
 });

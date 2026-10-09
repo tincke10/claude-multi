@@ -1,7 +1,12 @@
-import { Account, AccountOverview, Config, UsageLimits, UsageView } from "../api";
+import { useState } from "react";
+import { Account, AccountOverview, AccountStatus, Config } from "../api";
 import {
-  AuthAction, ACTION_LABEL, actionsFor, isSaved, statusPill, usageText,
+  AuthAction, ACTION_LABEL, actionsFor, isSaved, roomVariant,
 } from "../lib/accounts";
+import { vesselCaption } from "../lib/usageText";
+import Chip from "../components/Chip";
+import Room from "../components/Room";
+import Vessel from "../components/Vessel";
 import {
   CLAUDE_DIR_PREFIX, canActOnAccount, duplicateDirIndices, nextId, suffixOf, updateAt,
 } from "../lib/configDirs";
@@ -24,76 +29,45 @@ type Props = {
   accountsOverview: OverviewState;
 };
 
-function UsageBar({ name, u }: { name: string; u: UsageView }) {
+const EMPTY_COPY = "This room is empty. Log in to start using and tracking this account.";
+
+// Session and week from the current (local estimate) overview data. The
+// per-model vessel appears only once real usage data carries models (Phase 4+).
+function Vessels({ o }: { o: AccountOverview }) {
   return (
-    <div className="usage">
-      <span className="usage__name">{name}</span>
-      <span className="usage__track" aria-hidden="true">
-        {u.percent !== null && (
-          <span
-            className={`usage__fill ${u.percent >= 90 ? "usage__fill--hot" : ""}`}
-            style={{ width: `${u.percent}%` }}
-          />
-        )}
-      </span>
-      <span className="usage__text">{usageText(u)}</span>
+    <div className="vessels">
+      <Vessel name="Session" hint="5 hours" percent={o.session.percent} caption={vesselCaption(o.session)} />
+      <Vessel name="Week" hint="7 days" percent={o.week.percent} caption={vesselCaption(o.week)} />
     </div>
   );
 }
 
-function AccountStatusRow(props: {
-  overview: AccountOverview | undefined;
-  saved: boolean;
-  loaded: boolean;
+function RoomActions(props: {
+  status: AccountStatus;
   busy: boolean;
-  error: string | undefined;
   onAction: (a: AuthAction) => void;
 }) {
-  const { overview: o, saved, loaded, busy, error, onAction } = props;
-  if (!saved || !o) {
-    return (
-      <div className="row account__status">
-        <span className="muted">{loaded ? "Save first to log in and see usage." : "Checking…"}</span>
-      </div>
-    );
-  }
-  const pill = statusPill(o);
+  const { status, busy, onAction } = props;
   return (
-    <>
-      <div className="row account__status">
-        <span className={`pill pill--${pill.tone}`}>{pill.text}</span>
-        <span className="row__grow" />
-        {actionsFor(o.status).map((act) => (
-          <button
-            key={act}
-            className="btn btn--secondary btn--compact"
-            disabled={busy}
-            onClick={() => onAction(act)}
-          >{ACTION_LABEL[act]}</button>
-        ))}
-      </div>
-      {error && <p className="field-error">{error}</p>}
-      <UsageBar name="Session (5h)" u={o.session} />
-      <UsageBar name="Week (7d)" u={o.week} />
-    </>
+    <div className="room__acts">
+      {actionsFor(status).map((act, idx) => (
+        <button
+          key={act}
+          className={`btn ${idx === 0 && status !== "logged_in" ? "btn--primary" : ""}`}
+          disabled={busy}
+          onClick={() => onAction(act)}
+        >{ACTION_LABEL[act]}</button>
+      ))}
+    </div>
   );
 }
-
-// Parse a token-ceiling input: empty => null (unset); otherwise a non-negative
-// integer, ignoring anything that isn't a clean number.
-const parseCeiling = (raw: string): number | null => {
-  const t = raw.trim();
-  if (t === "") return null;
-  const n = Number(t);
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
-};
 
 export default function AccountsTab({ config: cfg, snapshot, patch, accountsOverview: ov }: Props) {
   // Accounts sharing a config dir would break isolation: flag them, block Save.
   const dupDirs = duplicateDirIndices(cfg.accounts);
   const setAccounts = (accounts: Account[]) => patch({ accounts });
-  const setAccountLimits = (i: number, u: Partial<UsageLimits>) =>
-    setAccounts(updateAt(cfg.accounts, i, { usage_limits: { ...cfg.accounts[i].usage_limits, ...u } }));
+  // A freshly added account opens its edit section so it can be named right away.
+  const [openId, setOpenId] = useState<string | null>(null);
 
   const addAccount = () => {
     const id = nextId(cfg.accounts.map((a) => a.id), "a");
@@ -102,12 +76,13 @@ export default function AccountsTab({ config: cfg, snapshot, patch, accountsOver
       inherit_overrides: {},
       usage_limits: { session_tokens: null, weekly_tokens: null },
     }]);
+    setOpenId(id);
   };
 
   return (
-    <section className="card">
-      <div className="card__head">
-        <h2 className="card__title">Accounts</h2>
+    <section aria-label="Accounts">
+      <div className="rooms__bar">
+        <h2 className="rooms__title">Accounts</h2>
         <div className="card__actions">
           <button
             className="btn btn--icon btn--refresh"
@@ -116,89 +91,89 @@ export default function AccountsTab({ config: cfg, snapshot, patch, accountsOver
             onClick={() => void ov.refresh()}
             disabled={ov.refreshing}
           >↻</button>
-          <button className="btn btn--ghost" onClick={addAccount}>+ Add account</button>
+          <button className="btn btn--ghost" onClick={addAccount}>Add account</button>
         </div>
       </div>
-      <p className="card__hint">
-        Each account is isolated in its own <code>{CLAUDE_DIR_PREFIX}…</code> config directory.
-        The tray shows its rolling token usage — <code>Session (5h)</code> and{" "}
-        <code>Week (7d)</code>. Set an approximate per-account token ceiling to see{" "}
-        <code>used / ceiling · %</code> (plans differ, so a work account may allow more than a
-        personal one). There's no local source for Anthropic's real limits, so calibrate: when
-        {" "}<code>/usage</code> shows e.g. 13% used, the ceiling ≈ current tokens ÷ 0.13. Leave
-        blank to show raw tokens.
-      </p>
 
       {ov.error && <p className="field-error">Couldn't read account status: {ov.error}</p>}
-      {cfg.accounts.length === 0 && <p className="muted">No accounts yet.</p>}
-      {cfg.accounts.map((a, i) => {
-        const row = ov.overview.find((o) => o.id === a.id);
-        return (
-          <div className="account" key={a.id}>
-            <div className="row">
-              <input
-                className="input row__grow"
-                placeholder="Label (e.g. Personal)"
-                value={a.label}
-                onChange={(e) => setAccounts(updateAt(cfg.accounts, i, { label: e.target.value }))}
-              />
-              <span className={`affix ${dupDirs.has(i) ? "affix--invalid" : ""}`}>
-                <span className="affix__prefix">{CLAUDE_DIR_PREFIX}</span>
-                <input
-                  className="input affix__input"
-                  placeholder="suffix"
-                  value={suffixOf(a.config_dir)}
-                  onChange={(e) =>
-                    setAccounts(updateAt(cfg.accounts, i, { config_dir: CLAUDE_DIR_PREFIX + e.target.value }))
-                  }
+      {cfg.accounts.length === 0 && (
+        <p className="muted">No accounts yet. Add one to give it its own sealed config directory.</p>
+      )}
+      <div className="rooms">
+        {cfg.accounts.map((a, i) => {
+          const row = ov.overview.find((o) => o.id === a.id);
+          const saved = isSaved(row, a.id, a.config_dir) && canActOnAccount(snapshot, a);
+          const status = saved && row ? row.status : null;
+          const err = ov.actionErrs[a.id];
+          return (
+            <Room
+              key={a.id}
+              variant={status === null ? "empty" : roomVariant(status)}
+              name={a.label.trim() || a.id}
+              email={status === "logged_out" ? null : row?.email}
+              dir={a.config_dir}
+            >
+              {status === null && (
+                <p className="room__empty">
+                  {ov.loaded ? "Save first to log in and see usage." : "Checking…"}
+                </p>
+              )}
+              {row && status === "logged_out" && <p className="room__empty">{EMPTY_COPY}</p>}
+              {row && status !== null && status !== "logged_out" && (
+                <>
+                  <Vessels o={row} />
+                  {status === "expired" && (
+                    <div className="room__chips"><Chip kind="warn">Session expired</Chip></div>
+                  )}
+                </>
+              )}
+              {err && <p className="field-error">{err}</p>}
+              {row && status !== null && (
+                <RoomActions
+                  status={status}
+                  busy={ov.busy.has(a.id)}
+                  onAction={(act) => void ov.runAuthAction(a.id, act)}
                 />
-              </span>
-              <button
-                className="btn btn--icon"
-                title="Remove account"
-                onClick={() => setAccounts(cfg.accounts.filter((_, j) => j !== i))}
-              >✕</button>
-            </div>
-            {dupDirs.has(i) && (
-              <p className="field-error">
-                Another account already uses <code>{a.config_dir}</code>. Each account needs its own config directory.
-              </p>
-            )}
-            <AccountStatusRow
-              overview={row}
-              saved={isSaved(row, a.id, a.config_dir) && canActOnAccount(snapshot, a)}
-              loaded={ov.loaded}
-              busy={ov.busy.has(a.id)}
-              error={ov.actionErrs[a.id]}
-              onAction={(act) => void ov.runAuthAction(a.id, act)}
-            />
-            <div className="row account__limits">
-              <label className="field">
-                <span className="field__label">Session (5h) ceiling</span>
-                <input
-                  className="input"
-                  type="number"
-                  min={0}
-                  placeholder="tokens, e.g. 5000000"
-                  value={a.usage_limits.session_tokens ?? ""}
-                  onChange={(e) => setAccountLimits(i, { session_tokens: parseCeiling(e.target.value) })}
-                />
-              </label>
-              <label className="field">
-                <span className="field__label">Week (7d) ceiling</span>
-                <input
-                  className="input"
-                  type="number"
-                  min={0}
-                  placeholder="tokens, e.g. 40000000"
-                  value={a.usage_limits.weekly_tokens ?? ""}
-                  onChange={(e) => setAccountLimits(i, { weekly_tokens: parseCeiling(e.target.value) })}
-                />
-              </label>
-            </div>
-          </div>
-        );
-      })}
+              )}
+              <details className="room__edit" open={openId === a.id ? true : undefined}>
+                <summary>Edit</summary>
+                <div className="row">
+                  <input
+                    className="input row__grow"
+                    aria-label="Account label"
+                    placeholder="Label (e.g. Personal)"
+                    value={a.label}
+                    onChange={(e) => setAccounts(updateAt(cfg.accounts, i, { label: e.target.value }))}
+                  />
+                  <button
+                    className="btn btn--icon"
+                    title="Remove account"
+                    aria-label={`Remove ${a.label || a.id}`}
+                    onClick={() => setAccounts(cfg.accounts.filter((_, j) => j !== i))}
+                  >✕</button>
+                </div>
+                <span className={`affix ${dupDirs.has(i) ? "affix--invalid" : ""}`}>
+                  <span className="affix__prefix">{CLAUDE_DIR_PREFIX}</span>
+                  <input
+                    className="input affix__input"
+                    aria-label="Config directory suffix"
+                    placeholder="suffix"
+                    value={suffixOf(a.config_dir)}
+                    onChange={(e) =>
+                      setAccounts(updateAt(cfg.accounts, i, { config_dir: CLAUDE_DIR_PREFIX + e.target.value }))
+                    }
+                  />
+                </span>
+                {dupDirs.has(i) && (
+                  <p className="field-error">
+                    Another account already uses <code>{a.config_dir}</code>. Each account needs its own config directory.
+                  </p>
+                )}
+              </details>
+            </Room>
+          );
+        })}
+      </div>
     </section>
   );
 }
