@@ -338,6 +338,38 @@ pub fn launch_session(
     })
 }
 
+/// Tray "Open in Orca": opens an Orca terminal running `cms <account>` in the
+/// worktree matching the project's path. Blocking (the Orca handshake can take
+/// a while), so callers run it off the main thread. Not a `#[tauri::command]`.
+#[cfg(target_os = "macos")]
+pub fn open_in_orca(app: &AppHandle, account_id: &str, project_id: &str) -> Result<(), String> {
+    use crate::orca::{open, source};
+    let cfg = load_config(app)?;
+    let account = cfg.account(account_id).ok_or("unknown account")?;
+    let project = cfg.project(project_id).ok_or("unknown project")?;
+
+    let project_path = expand_tilde(&project.path);
+    validate_project_dir(&project.label, &project_path)?;
+    session::ensure_session_usable(account)?;
+
+    let cli = std::path::Path::new(source::CLI_PATH);
+    if !cli.is_file() {
+        return Err("Orca isn't installed.".into());
+    }
+    let cms = crate::cms_path::resolve();
+    let args = open::build_open_in_orca_args(
+        &project_path.to_string_lossy(),
+        cms.as_deref().and_then(|p| p.to_str()),
+        &account.id,
+    );
+    open::open_in_orca(cli, &args, &open::OpenTimings::default())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_orca(_app: &AppHandle, _account_id: &str, _project_id: &str) -> Result<(), String> {
+    Err("Open in Orca is only available on macOS.".into())
+}
+
 /// A project-less action performed under one account's `CLAUDE_CONFIG_DIR`.
 enum AccountAction {
     Login,

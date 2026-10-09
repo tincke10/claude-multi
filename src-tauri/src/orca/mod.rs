@@ -11,6 +11,7 @@ pub mod derive;
 pub mod health;
 pub mod import;
 pub mod model;
+pub mod open;
 pub mod plan;
 #[cfg(target_os = "macos")]
 pub mod probe;
