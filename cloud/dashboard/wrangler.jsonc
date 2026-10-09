@@ -6,6 +6,11 @@
   "compatibility_date": "2026-10-09",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
+  // Only the workers.dev hostname is served, and Access protects it. Preview
+  // URLs (<version>-cm-dashboard.<subdomain>.workers.dev) are extra hostnames
+  // Access might not cover, so they stay off.
+  "workers_dev": true,
+  "preview_urls": false,
   "assets": {
     "directory": "./dist/client",
     "binding": "ASSETS",
