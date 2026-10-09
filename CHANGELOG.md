@@ -8,6 +8,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Accounts panel in Preferences**: each saved account shows its login status
+  (logged in with email, session expired, not logged in), Login / Logout /
+  Relogin buttons (via the configured terminal) and Session (5h) / Week (7d)
+  usage bars, with a refresh button. Useful when the tray menu is out of reach
+  (e.g. behind the display notch).
 - **Orca integration (macOS, read-only)**: Preferences gets an Orca panel with a
   **health check** (cms on the login PATH and same version as the app, Orca's
   agent command override, managed-account conflicts, unmapped repos), **Import

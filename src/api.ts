@@ -109,3 +109,23 @@ export const listOrcaImportCandidates = () => invoke<ImportList>("list_orca_impo
 // Resolves to the projects the backend persisted (it never reloads the window's state).
 export const importOrcaRepos = (selections: ImportSelection[]) =>
   invoke<Project[]>("import_orca_repos", { selections });
+
+// Preferences Accounts card: login status + rolling usage per saved account.
+export type AccountStatus = "logged_in" | "logged_out" | "expired";
+// `percent` is clamped to 100 and null without a ceiling (show raw tokens).
+export type UsageView = { used: number; ceiling: number | null; percent: number | null };
+export type AccountOverview = {
+  id: string;
+  label: string;
+  config_dir: string;
+  status: AccountStatus;
+  email: string | null;
+  dir_exists: boolean;
+  session: UsageView;
+  week: UsageView;
+};
+export const accountsOverview = () => invoke<AccountOverview[]>("accounts_overview");
+// These open the configured terminal; the outcome shows up later in the overview.
+export const loginAccount = (accountId: string) => invoke<void>("login_account", { accountId });
+export const logoutAccount = (accountId: string) => invoke<void>("logout_account", { accountId });
+export const reloginAccount = (accountId: string) => invoke<void>("relogin_account", { accountId });
