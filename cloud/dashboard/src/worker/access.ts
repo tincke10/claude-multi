@@ -48,7 +48,12 @@ export async function authorizeAccess(
   if (token === null || token === "") return forbidden();
   try {
     const keys = getKey ?? remoteJwks(config.teamDomain);
-    const { payload } = await jwtVerify(token, keys, { issuer: config.teamDomain, audience: config.aud });
+    const { payload } = await jwtVerify(token, keys, {
+      issuer: config.teamDomain,
+      audience: config.aud,
+      // Cloudflare Access signs with RS256; pin it so no other alg is accepted.
+      algorithms: ["RS256"],
+    });
     return { ok: true, email: typeof payload["email"] === "string" ? payload["email"] : undefined };
   } catch {
     return forbidden();
