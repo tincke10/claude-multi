@@ -95,6 +95,21 @@ pub struct EndpointSample {
     pub fetched_at: i64,
 }
 
+/// Everything the opt-in endpoint told us about one account (or why it could
+/// not). Built by `usage_endpoint`; merged by [`build_usage`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EndpointReading {
+    pub session: Option<EndpointSample>,
+    pub week: Option<EndpointSample>,
+    /// Per-model weekly buckets, labelled as Anthropic names them ("Fable").
+    pub models: Vec<(String, EndpointSample)>,
+    /// Plan label from the profile ("Max 20x"), when `.claude.json` lacks one.
+    pub tier: Option<String>,
+    pub org: Option<String>,
+    /// Why the endpoint has nothing to show (shown as a note), if so.
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountUsage {
     pub session: UsageWindow,
@@ -103,6 +118,8 @@ pub struct AccountUsage {
     pub models: Vec<ModelWindow>,
     pub tier: Option<String>,
     pub org: Option<String>,
+    /// Why the opt-in endpoint has nothing to show, if it is on and failing.
+    pub endpoint_note: Option<String>,
 }
 
 /// Everything `build_usage` needs, already read from disk.
@@ -111,6 +128,7 @@ pub struct UsageInputs<'a> {
     pub session_estimate: &'a UsageSummary,
     pub week_estimate: &'a UsageSummary,
     pub oauth: Option<&'a OauthAccount>,
+    pub endpoint: Option<&'a EndpointReading>,
     pub now: i64,
 }
 
@@ -205,31 +223,57 @@ pub fn merge_window(
 
 pub fn build_usage(inputs: &UsageInputs<'_>) -> AccountUsage {
     let rec = inputs.record;
-    let window = |sample: Option<&WindowSample>, estimate, secs| {
-        let st = sample.zip(rec.map(|r| r.captured_at));
-        merge_window(None, st, estimate, secs, inputs.now)
-    };
+    let ep = inputs.endpoint;
+    let window =
+        |endpoint: Option<&EndpointSample>, sample: Option<&WindowSample>, estimate, secs| {
+            let st = sample.zip(rec.map(|r| r.captured_at));
+            merge_window(endpoint, st, estimate, secs, inputs.now)
+        };
     let oauth = inputs.oauth;
-    let tier = oauth.and_then(|o| {
-        o.rate_tier
-            .as_deref()
-            .and_then(tier_label)
-            .or_else(|| o.org_type.as_deref().and_then(tier_label))
-    });
+    let tier = oauth
+        .and_then(|o| {
+            o.rate_tier
+                .as_deref()
+                .and_then(tier_label)
+                .or_else(|| o.org_type.as_deref().and_then(tier_label))
+        })
+        .or_else(|| ep.and_then(|e| e.tier.clone()));
+    // Per-model buckets exist only on the endpoint; a stale or already-reset
+    // sample is dropped rather than drawn as if it were current.
+    let empty = UsageSummary::default();
+    let models = ep
+        .map(|e| {
+            e.models
+                .iter()
+                .filter_map(|(label, sample)| {
+                    let w = merge_window(Some(sample), None, &empty, WEEK_WINDOW_SECS, inputs.now);
+                    (w.source == UsageSource::Endpoint).then(|| ModelWindow {
+                        label: label.clone(),
+                        window: w,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     AccountUsage {
         session: window(
+            ep.and_then(|e| e.session.as_ref()),
             rec.and_then(|r| r.five_hour.as_ref()),
             inputs.session_estimate,
             SESSION_WINDOW_SECS,
         ),
         week: window(
+            ep.and_then(|e| e.week.as_ref()),
             rec.and_then(|r| r.seven_day.as_ref()),
             inputs.week_estimate,
             WEEK_WINDOW_SECS,
         ),
-        models: Vec::new(),
+        models,
         tier,
-        org: oauth.and_then(|o| o.org_name.clone()),
+        org: oauth
+            .and_then(|o| o.org_name.clone())
+            .or_else(|| ep.and_then(|e| e.org.clone())),
+        endpoint_note: ep.and_then(|e| e.note.clone()),
     }
 }
 
@@ -289,6 +333,7 @@ pub fn build_overview(
                 models: Vec::new(),
                 tier: None,
                 org: None,
+                endpoint_note: None,
             }
         },
     }
@@ -359,6 +404,7 @@ mod tests {
                 session_estimate: &est,
                 week_estimate: &est,
                 oauth: None,
+                endpoint: None,
                 now: NOW,
             },
         )
@@ -639,6 +685,7 @@ mod tests {
             session_estimate: &est,
             week_estimate: &est,
             oauth: None,
+            endpoint: None,
             now: NOW,
         });
         assert_eq!(u.session.percent, Some(36.0));
@@ -657,6 +704,7 @@ mod tests {
             session_estimate: &s_est,
             week_estimate: &w_est,
             oauth: None,
+            endpoint: None,
             now: NOW,
         });
         assert_eq!(u.session.source, UsageSource::Statusline);
@@ -678,6 +726,7 @@ mod tests {
             session_estimate: &est,
             week_estimate: &est,
             oauth: Some(&oauth),
+            endpoint: None,
             now: NOW,
         });
         assert_eq!(u.tier.as_deref(), Some("Max 20x"));
@@ -697,6 +746,7 @@ mod tests {
             session_estimate: &est,
             week_estimate: &est,
             oauth: Some(&oauth),
+            endpoint: None,
             now: NOW,
         });
         assert_eq!(u.tier.as_deref(), Some("Team"));
@@ -790,6 +840,7 @@ mod tests {
                 session_estimate: &est,
                 week_estimate: &est,
                 oauth: None,
+                endpoint: None,
                 now: NOW,
             },
         );
@@ -814,6 +865,7 @@ mod tests {
                 session_estimate: &est,
                 week_estimate: &est,
                 oauth: None,
+                endpoint: None,
                 now: NOW,
             },
         );
@@ -824,5 +876,103 @@ mod tests {
         assert_eq!(v["usage"]["session"]["percent"], 36.0);
         assert_eq!(v["usage"]["week"]["source"], "none");
         assert_eq!(v["usage"]["week"]["percent"], serde_json::Value::Null);
+    }
+
+    // ---- endpoint merge (Phase 5) --------------------------------------
+
+    fn reading() -> EndpointReading {
+        let at = |pct: f64, resets: i64| EndpointSample {
+            percent: pct,
+            resets_at: resets,
+            fetched_at: NOW - 30,
+        };
+        EndpointReading {
+            session: Some(at(42.0, NOW + 3000)),
+            week: Some(at(71.0, NOW + 90_000)),
+            models: vec![("Fable".into(), at(88.0, NOW + 90_000))],
+            tier: Some("Max 20x".into()),
+            org: Some("Example Org".into()),
+            note: None,
+        }
+    }
+
+    fn usage_with(
+        endpoint: Option<&EndpointReading>,
+        record: Option<&UsageRecord>,
+        oauth: Option<&OauthAccount>,
+    ) -> AccountUsage {
+        let est = none();
+        build_usage(&UsageInputs {
+            record,
+            session_estimate: &est,
+            week_estimate: &est,
+            oauth,
+            endpoint,
+            now: NOW,
+        })
+    }
+
+    #[test]
+    fn test_should_prefer_endpoint_windows_and_fill_per_model_vessels() {
+        let rec = record(
+            NOW - 60,
+            Some(sample(36.0, NOW + 3000)),
+            Some(sample(85.0, NOW + 90_000)),
+        );
+        let r = reading();
+        let u = usage_with(Some(&r), Some(&rec), None);
+        assert_eq!(u.session.source, UsageSource::Endpoint);
+        assert_eq!(u.session.percent, Some(42.0));
+        assert_eq!(u.week.source, UsageSource::Endpoint);
+        assert_eq!(u.models.len(), 1);
+        assert_eq!(u.models[0].label, "Fable");
+        assert_eq!(u.models[0].window.percent, Some(88.0));
+        assert_eq!(u.models[0].window.source, UsageSource::Endpoint);
+        assert_eq!(u.tier.as_deref(), Some("Max 20x"));
+        assert_eq!(u.org.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn test_should_keep_claude_json_tier_over_the_profile_tier() {
+        let oauth = OauthAccount {
+            email: None,
+            org_name: Some("Local Org".into()),
+            rate_tier: Some("default_claude_max_5x".into()),
+            org_type: None,
+        };
+        let r = reading();
+        let u = usage_with(Some(&r), None, Some(&oauth));
+        assert_eq!(u.tier.as_deref(), Some("Max 5x"));
+        assert_eq!(u.org.as_deref(), Some("Local Org"));
+    }
+
+    #[test]
+    fn test_should_fall_back_to_statusline_and_drop_models_when_endpoint_is_stale() {
+        let rec = record(NOW - 60, Some(sample(36.0, NOW + 3000)), None);
+        let mut r = reading();
+        r.session.as_mut().unwrap().fetched_at = NOW - 20 * 60;
+        r.models[0].1.fetched_at = NOW - 20 * 60;
+        r.note = Some("Anthropic's usage API is rate-limiting requests.".into());
+        let u = usage_with(Some(&r), Some(&rec), None);
+        assert_eq!(u.session.source, UsageSource::Statusline);
+        assert!(u.models.is_empty());
+        assert!(u.endpoint_note.unwrap().contains("rate-limiting"));
+    }
+
+    #[test]
+    fn test_should_have_no_models_and_no_note_without_endpoint_data() {
+        let u = usage_with(None, None, None);
+        assert!(u.models.is_empty());
+        assert_eq!(u.endpoint_note, None);
+    }
+
+    #[test]
+    fn test_should_serialize_endpoint_source_models_and_note() {
+        let mut r = reading();
+        r.note = Some("n".into());
+        let v = serde_json::to_value(usage_with(Some(&r), None, None)).unwrap();
+        assert_eq!(v["session"]["source"], "endpoint");
+        assert_eq!(v["models"][0]["label"], "Fable");
+        assert_eq!(v["endpoint_note"], "n");
     }
 }

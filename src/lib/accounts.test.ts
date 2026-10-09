@@ -5,7 +5,7 @@ import { ACTION_LABEL, actionsFor, humanTokens, isSaved, roomVariant } from "./a
 const noWindow: UsageWindow = {
   percent: null, resets_at: null, source: "none", age_secs: null, stale: false, est_tokens: null, pacing: null,
 };
-const usage = (): AccountUsage => ({ session: noWindow, week: noWindow, models: [], tier: null, org: null });
+const usage = (): AccountUsage => ({ session: noWindow, week: noWindow, models: [], tier: null, org: null, endpoint_note: null });
 const overview = (o: Partial<AccountOverview> = {}): AccountOverview => ({
   id: "a1", label: "A", config_dir: "~/.claude-a", status: "logged_in", email: "x@y.z",
   dir_exists: true, usage: usage(), ...o,

@@ -42,6 +42,33 @@ export default function SettingsTab({ config, terminals, patch }: Props) {
         keeps showing exactly as before. Turning it off restores your original statusline.
       </p>
     </section>
+
+    <section className="card">
+      <div className="card__head">
+        <h2 className="card__title">Account API (advanced)</h2>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={config.usage.endpoint_enabled}
+            onChange={(e) =>
+              patch({ usage: { ...config.usage, endpoint_enabled: e.target.checked } })
+            }
+          />
+          <span>Read usage from Anthropic's account API (advanced)</span>
+        </label>
+      </div>
+      <p className="card__hint">
+        Adds exact per-model limits (for example Fable) and your plan. Off by default.
+      </p>
+      <p className="banner banner--warn" role="note">
+        This API is undocumented, so it may break or start rate-limiting at any time. It sits in a
+        grey area of Anthropic's terms: Claude Code's terms say developers may not collect, store
+        or intermediate Claude.ai credentials or session tokens. Claude Multi only reads your own
+        access token locally, in memory, and sends it to Anthropic's API alone. It never stores,
+        refreshes or sends it anywhere else. The requests share rate limits with Claude Code, and
+        macOS may ask for Keychain access.
+      </p>
+    </section>
     </>
   );
 }

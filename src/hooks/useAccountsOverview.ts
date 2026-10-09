@@ -28,10 +28,10 @@ export function useAccountsOverview() {
   const overviewRef = useRef<AccountOverview[]>([]);
   const pollTimers = useRef<Map<string, number>>(new Map());
 
-  const refresh = async (): Promise<AccountOverview[] | null> => {
+  const refresh = async (force = false): Promise<AccountOverview[] | null> => {
     setRefreshing(true);
     try {
-      const rows = await accountsOverview();
+      const rows = await accountsOverview(force);
       if (!mounted.current) return null;
       overviewRef.current = rows;
       setOverview(rows);

@@ -4,7 +4,7 @@ import {
   AuthAction, ACTION_LABEL, actionsFor, isSaved, roomVariant,
 } from "../lib/accounts";
 import {
-  chipsFor, countdown, estimatedChip, freshnessChip, resetText, vesselCaption,
+  chipsFor, countdown, estimatedChip, freshnessChip, resetText, sourceChip, vesselCaption,
 } from "../lib/usageText";
 import Chip from "../components/Chip";
 import Room from "../components/Room";
@@ -20,7 +20,7 @@ type OverviewState = {
   refreshing: boolean;
   actionErrs: Record<string, string>;
   busy: Set<string>;
-  refresh: () => Promise<unknown>;
+  refresh: (force?: boolean) => Promise<unknown>;
   runAuthAction: (id: string, action: AuthAction) => Promise<void>;
 };
 
@@ -44,7 +44,7 @@ function resetsInFor(w: UsageWindow, now: number): string | undefined {
   return w.resets_at !== null && w.resets_at > now ? countdown(w.resets_at - now) : undefined;
 }
 
-// Session and week with real usage; per-model vessels arrive with the endpoint.
+// Session and week, plus one vessel per model the opt-in account API reports.
 function Vessels({ o }: { o: AccountOverview }) {
   const { session, week } = o.usage;
   const now = nowSecs();
@@ -58,6 +58,13 @@ function Vessels({ o }: { o: AccountOverview }) {
         name="Week" hint="7 days" percent={week.percent}
         caption={captionFor(week, now)} resetsIn={resetsInFor(week, now)}
       />
+      {o.usage.models.map((m) => (
+        <Vessel
+          key={m.label} name={m.label}
+          percent={m.window.percent}
+          caption={captionFor(m.window, now)} resetsIn={resetsInFor(m.window, now)}
+        />
+      ))}
     </div>
   );
 }
@@ -67,12 +74,15 @@ function RoomChips({ o }: { o: AccountOverview }) {
   const chips = chipsFor({ tier, session: session.pacing, week: week.pacing });
   const fresh = freshnessChip(session, week);
   const estimated = estimatedChip(session, week);
+  const source = sourceChip(session, week);
   return (
     <div className="room__chips">
       {o.status === "expired" && <Chip kind="warn">Session expired</Chip>}
       {chips.map((c) => <Chip key={c.text} kind={c.kind}>{c.text}</Chip>)}
+      {source && <Chip kind="muted">{source}</Chip>}
       {estimated && <Chip kind="muted">{estimated}</Chip>}
       {fresh && <Chip kind={fresh.stale ? "warn" : "muted"}>{fresh.text}</Chip>}
+      {o.usage.endpoint_note && <p className="room__note">{o.usage.endpoint_note}</p>}
     </div>
   );
 }
@@ -123,7 +133,7 @@ export default function AccountsTab({ config: cfg, snapshot, patch, accountsOver
             className="btn btn--icon btn--refresh"
             title="Refresh login status and usage"
             aria-label="Refresh login status and usage"
-            onClick={() => void ov.refresh()}
+            onClick={() => void ov.refresh(true)}
             disabled={ov.refreshing}
           >↻</button>
           <button className="btn btn--ghost" onClick={addAccount}>Add account</button>

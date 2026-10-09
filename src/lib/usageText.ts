@@ -53,6 +53,14 @@ export function freshnessChip(session: UsageWindow, week: UsageWindow): Freshnes
   return { text: updatedText(Math.max(...ages)), stale: session.stale || week.stale };
 }
 
+// Where the numbers come from, when we have real ones: the account API wins.
+export function sourceChip(session: UsageWindow, week: UsageWindow): string | null {
+  const sources = [session.source, week.source];
+  if (sources.includes("endpoint")) return "Account API";
+  if (sources.includes("statusline")) return "Statusline";
+  return null;
+}
+
 export const estimatedChip = (session: UsageWindow, week: UsageWindow): string | null =>
   session.source === "estimate" || week.source === "estimate" ? "Estimated" : null;
 

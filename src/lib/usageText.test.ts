@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { UsageWindow } from "../api";
 import {
-  chipsFor, estimatedChip, freshnessChip, resetText, stalenessLabel, updatedText,
+  chipsFor, estimatedChip, freshnessChip, sourceChip, resetText, stalenessLabel, updatedText,
   vesselAriaLabel, vesselCaption, vesselLabels, vesselValue,
 } from "./usageText";
 
@@ -125,5 +125,19 @@ describe("resetText", () => {
     expect(resetText(null, now)).toBeNull();
     expect(resetText(now, now)).toBeNull();
     expect(resetText(now - 5, now)).toBeNull();
+  });
+});
+
+describe("sourceChip", () => {
+  it("names the account API when any window comes from the endpoint", () => {
+    expect(sourceChip(win({ source: "endpoint" }), win({ source: "statusline" }))).toBe("Account API");
+    expect(sourceChip(win({ source: "statusline" }), win({ source: "endpoint" }))).toBe("Account API");
+  });
+  it("names the statusline when that is the best source", () => {
+    expect(sourceChip(win({ source: "statusline" }), win())).toBe("Statusline");
+  });
+  it("shows nothing for estimates (they have their own chip) or no data", () => {
+    expect(sourceChip(win({ source: "estimate", est_tokens: 5 }), win())).toBeNull();
+    expect(sourceChip(win(), win())).toBeNull();
   });
 });

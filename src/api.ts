@@ -141,6 +141,8 @@ export type AccountUsage = {
   models: ModelWindow[];
   tier: string | null;
   org: string | null;
+  // Why the opt-in account API has nothing to show right now, if it is on.
+  endpoint_note: string | null;
 };
 export type AccountOverview = {
   id: string;
@@ -151,7 +153,9 @@ export type AccountOverview = {
   dir_exists: boolean;
   usage: AccountUsage;
 };
-export const accountsOverview = () => invoke<AccountOverview[]>("accounts_overview");
+// `refresh` forces the opt-in account API to re-query (still rate limited server-side).
+export const accountsOverview = (refresh = false) =>
+  invoke<AccountOverview[]>("accounts_overview", { refresh });
 // These open the configured terminal; the outcome shows up later in the overview.
 export const loginAccount = (accountId: string) => invoke<void>("login_account", { accountId });
 export const logoutAccount = (accountId: string) => invoke<void>("logout_account", { accountId });

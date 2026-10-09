@@ -519,10 +519,19 @@ pub fn relogin_account(app: AppHandle, account_id: String) -> Result<(), String>
 /// config dir and never opens a terminal. Keychain reads and log scans run on a
 /// blocking thread so the UI thread never stalls.
 #[tauri::command]
-pub async fn accounts_overview(app: AppHandle) -> Result<Vec<AccountOverview>, String> {
+pub async fn accounts_overview(
+    app: AppHandle,
+    refresh: Option<bool>,
+) -> Result<Vec<AccountOverview>, String> {
     // Lock-free config read; the probes below can take a while.
     let cfg = load_config(&app)?;
+    let force = refresh.unwrap_or(false);
+    let endpoint_on = cfg.usage.endpoint_enabled;
+    let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let cache = handle.state::<crate::usage_endpoint::EndpointCache>();
+        let transport = crate::usage_endpoint::UreqTransport::default();
         let now = chrono::Utc::now();
         let session_since = usage::session_window_start(now);
         let week_since = usage::week_window_start(now);
@@ -540,6 +549,7 @@ pub async fn accounts_overview(app: AppHandle) -> Result<Vec<AccountOverview>, S
                         session_estimate: &empty,
                         week_estimate: &empty,
                         oauth: None,
+                        endpoint: None,
                         now: now.timestamp(),
                     };
                     return overview::build_overview(account, &none, false, &inputs);
@@ -551,11 +561,37 @@ pub async fn accounts_overview(app: AppHandle) -> Result<Vec<AccountOverview>, S
                     .as_deref()
                     .and_then(|d| crate::statusline::read_usage_record(d, &dir.to_string_lossy()));
                 let oauth = crate::config::read_oauth_account(&dir);
+                // Opt-in, sequential across accounts (shares Claude Code's rate
+                // limits), only for a usable login; the cache enforces TTL/backoff.
+                let endpoint = matches!(status, session::SessionStatus::LoggedIn { .. })
+                    .then(|| {
+                        let has_tier = oauth.as_ref().is_some_and(|o| {
+                            o.rate_tier
+                                .as_deref()
+                                .and_then(overview::tier_label)
+                                .or_else(|| o.org_type.as_deref().and_then(overview::tier_label))
+                                .is_some()
+                        });
+                        crate::usage_endpoint::fetch_account(
+                            &cache,
+                            &crate::usage_endpoint::FetchRequest {
+                                enabled: endpoint_on,
+                                dir: &dir,
+                                now: now.timestamp(),
+                                force,
+                                need_profile: !has_tier,
+                            },
+                            &session::read_access_token,
+                            &transport,
+                        )
+                    })
+                    .flatten();
                 let inputs = overview::UsageInputs {
                     record: record.as_ref(),
                     session_estimate: &windows[0],
                     week_estimate: &windows[1],
                     oauth: oauth.as_ref(),
+                    endpoint: endpoint.as_ref(),
                     now: now.timestamp(),
                 };
                 overview::build_overview(account, &status, true, &inputs)
