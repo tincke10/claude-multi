@@ -2,7 +2,7 @@
 //!
 //! A hook must never hurt the user's session: every path here ends in exit 0,
 //! nothing is printed to stdout (SessionStart stdout would be injected into
-//! the model's context), and failures go to `hook.log` in the app config dir.
+//! the model's context), and failures go to `hook.log` in the app local data dir.
 //! Events are POSTed to `cm-ingest /api/events`; when that fails they are
 //! spooled to disk (0600, atomic, capped) and flushed by the next invocation.
 //! Decision logic is pure and unit-tested; I/O sits at the edge.
@@ -528,12 +528,39 @@ pub fn local_ip() -> Option<String> {
     Some(s.local_addr().ok()?.ip().to_string()).filter(|ip| ip != "0.0.0.0")
 }
 
+/// Machine-local state dir (spool, jobs, hook.log): the single source of
+/// truth. Local, not Roaming, so queued events and logs never sync across
+/// Windows machines.
 fn app_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(crate::paths::APP_IDENTIFIER))
+    dirs::data_local_dir().map(|d| d.join(crate::paths::APP_IDENTIFIER))
 }
 
 pub fn spool_dir() -> Option<PathBuf> {
     app_dir().map(|d| d.join("spool"))
+}
+
+/// Where the spool lived before moving to the local data dir.
+fn legacy_spool_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join(crate::paths::APP_IDENTIFIER).join("spool"))
+}
+
+/// Moves up to `limit` spooled events from `legacy` into `dir` so the normal
+/// flush delivers them. No-op when the dirs coincide (macOS) or `legacy` is
+/// missing. Returns how many files were moved.
+pub fn migrate_legacy_spool(legacy: &Path, dir: &Path, limit: usize) -> usize {
+    if legacy == dir || !legacy.is_dir() {
+        return 0;
+    }
+    let mut moved = 0;
+    for name in spool_list(legacy).into_iter().take(limit) {
+        if crate::paths::create_private_dir(dir).is_err() {
+            break;
+        }
+        if std::fs::rename(legacy.join(&name), dir.join(&name)).is_ok() {
+            moved += 1;
+        }
+    }
+    moved
 }
 
 pub fn now_ms() -> u64 {
@@ -547,7 +574,7 @@ pub fn format_log_line(ts_ms: u64, msg: &str) -> String {
     format!("{ts_ms} {}\n", msg.replace(['\n', '\r'], " "))
 }
 
-/// Best-effort error log (`<app config dir>/hook.log`, 0600, size-capped).
+/// Best-effort error log (`<app local data dir>/hook.log`, 0600, size-capped).
 /// Never include secrets in `msg`.
 pub fn log_error(msg: &str) {
     let Some(dir) = app_dir() else { return };
@@ -629,6 +656,9 @@ pub fn run(phase: HookPhase) {
     }
     let result = std::panic::catch_unwind(|| {
         let Some(dir) = spool_dir() else { return };
+        if let Some(legacy) = legacy_spool_dir() {
+            migrate_legacy_spool(&legacy, &dir, SPOOL_CAP);
+        }
         let cfg = match load_cfg() {
             Ok(c) => c,
             Err(e) => return log_error(&format!("config: {e}")),
@@ -1289,6 +1319,78 @@ mod tests {
         assert!(l.ends_with('\n'));
         assert_eq!(l.matches('\n').count(), 1);
         assert!(l.contains("a b"));
+    }
+
+    fn spool_file(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), "{}").unwrap();
+    }
+
+    #[test]
+    fn test_should_keep_spool_and_log_under_local_data_dir() {
+        let base = dirs::data_local_dir()
+            .unwrap()
+            .join(crate::paths::APP_IDENTIFIER);
+        assert_eq!(spool_dir().unwrap(), base.join("spool"));
+        assert_eq!(app_dir().unwrap(), base);
+    }
+
+    #[test]
+    fn test_should_move_legacy_spool_files_into_new_dir_when_migrating() {
+        let d = tempfile::tempdir().unwrap();
+        let (old, new) = (d.path().join("old/spool"), d.path().join("new/spool"));
+        spool_file(&old, "0000000000001-a.json");
+        spool_file(&old, "0000000000002-b.json");
+        spool_file(&old, ".spool-tmp");
+        assert_eq!(migrate_legacy_spool(&old, &new, 10), 2);
+        assert_eq!(spool_list(&new).len(), 2);
+        assert!(spool_list(&old).is_empty());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&new), 0o700);
+    }
+
+    #[test]
+    fn test_should_move_at_most_limit_oldest_when_migrating() {
+        let d = tempfile::tempdir().unwrap();
+        let (old, new) = (d.path().join("old"), d.path().join("new"));
+        for i in 1..=5 {
+            spool_file(&old, &format!("{i:013}-x.json"));
+        }
+        assert_eq!(migrate_legacy_spool(&old, &new, 3), 3);
+        assert_eq!(spool_list(&old).len(), 2);
+        assert_eq!(spool_list(&new)[0], "0000000000001-x.json");
+    }
+
+    #[test]
+    fn test_should_do_nothing_when_legacy_missing_or_same_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let same = d.path().join("s");
+        spool_file(&same, "0000000000001-a.json");
+        assert_eq!(migrate_legacy_spool(&same, &same, 10), 0);
+        assert_eq!(spool_list(&same).len(), 1);
+        assert_eq!(migrate_legacy_spool(&d.path().join("nope"), &same, 10), 0);
+    }
+
+    #[test]
+    fn test_should_flush_migrated_legacy_events_when_hook_runs() {
+        let rig = Rig::new();
+        let (old, new) = (rig.dir.path().join("old"), rig.dir.path().join("new"));
+        spool_file(&old, "0000000000001-a.json");
+        migrate_legacy_spool(&old, &new, 10);
+        let send = send_fn(&rig.outcomes, &rig.sent);
+        let spawn = |_: &Path| Ok(());
+        handle_hook(
+            HookPhase::Start,
+            START,
+            &env(),
+            &cfg(true, false),
+            &new,
+            100,
+            &send,
+            &spawn,
+        );
+        assert_eq!(rig.sent.borrow().len(), 2);
+        assert!(spool_list(&new).is_empty());
     }
 
     #[cfg(unix)]

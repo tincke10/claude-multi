@@ -235,8 +235,10 @@ the default `~/.claude`.
 **Disable.** Untick **Enabled** and Save: telemetry env vars stop being injected
 on the next launch (already-running sessions keep theirs until they end) and
 the hook entries are removed from every account's `settings.json` (only those
-claude-multi added). Failed deliveries are spooled locally (capped at 500) and
-flushed later; the hook always exits 0 and never blocks Claude Code.
+claude-multi added). Failed deliveries are spooled locally (capped at 500, in the
+machine-local data dir: `~/Library/Application Support/<id>/spool` on macOS,
+`~/.local/share/<id>/spool` on Linux, `%LOCALAPPDATA%\<id>\spool` on Windows,
+owner-only) and flushed later; the hook always exits 0 and never blocks Claude Code.
 
 ---
 
