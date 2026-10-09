@@ -503,6 +503,10 @@ pub fn http_post(url: &str, token: &str, body: &str) -> SendOutcome {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(HTTP_TIMEOUT))
         .http_status_as_error(false)
+        // Never follow redirects: a 3xx is a failure (spooled), so the token
+        // and payload are never replayed to another host.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
         .build()
         .into();
     match agent
@@ -1382,6 +1386,34 @@ mod tests {
         assert!(lower.contains("authorization: bearer sekret"));
         assert!(lower.contains("content-type: application/json"));
         assert!(req.ends_with(r#"{"type":"start"}"#));
+    }
+
+    #[test]
+    fn test_should_not_follow_redirect_and_spool_when_server_replies_3xx() {
+        // Second stub must never be contacted: accept non-blocking and assert idle.
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        second.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/steal", second.local_addr().unwrap());
+
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", first.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = first.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        });
+        let out = http_post(&events_url(&url), "sekret", r#"{"type":"start"}"#);
+        h.join().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            matches!(second.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "redirect target was contacted"
+        );
+        assert_eq!(classify(&out), Disposition::Retry, "{out:?}");
     }
 
     #[test]
