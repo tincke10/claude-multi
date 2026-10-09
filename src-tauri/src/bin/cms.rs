@@ -6,7 +6,7 @@ use claude_multi_lib::cli::{
     launch_plan, match_account, parse_cli_args, AccountMatchError, CliCommand,
 };
 use claude_multi_lib::config::Config;
-use claude_multi_lib::{inherit, paths, session};
+use claude_multi_lib::{hook, inherit, paths, session, summary};
 use std::process::ExitCode;
 
 fn usage() -> String {
@@ -44,7 +44,22 @@ fn load_config() -> Result<Config, String> {
 
 fn run() -> Result<ExitCode, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Hook paths gate first, before any config load or usage output: a hook
+    // must stay silent (SessionStart stdout reaches the model) and exit 0
+    // whatever happens, even on a malformed `--hook` invocation.
+    if args.first().map(String::as_str) == Some("--hook") {
+        if let CliCommand::Hook { phase } = parse_cli_args(&args) {
+            hook::run(phase);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     match parse_cli_args(&args) {
+        CliCommand::Summarize { job } => {
+            summary::run_worker(&job);
+            Ok(ExitCode::SUCCESS)
+        }
+        // Handled above; kept for exhaustiveness.
+        CliCommand::Hook { .. } => Ok(ExitCode::SUCCESS),
         CliCommand::Help { explicit } => {
             let text = match load_config() {
                 Ok(cfg) => format!("{}\n\nAccounts:\n{}", usage(), account_list(&cfg)),

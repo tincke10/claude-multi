@@ -46,4 +46,5 @@ sha2 = "0.10"
 dirs = "6"
 base64 = "0.22"
 gethostname = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 

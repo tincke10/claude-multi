@@ -17,6 +17,23 @@ pub enum CliCommand {
         query: String,
         claude_args: Vec<String>,
     },
+    /// `cms --hook start|end`: a Claude Code SessionStart/SessionEnd hook.
+    /// Flag form on purpose, so an account named `hook` still launches.
+    Hook {
+        phase: HookPhase,
+    },
+    /// Internal: `cms --summarize <job-file>`, the detached summary worker
+    /// re-exec'd by `--hook end`. Not listed in the usage text.
+    Summarize {
+        job: std::path::PathBuf,
+    },
+}
+
+/// Which hook event `cms --hook` is handling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HookPhase {
+    Start,
+    End,
 }
 
 /// Why an account query failed to resolve. `Ambiguous` carries the candidate
@@ -74,6 +91,18 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
         None => CliCommand::Help { explicit: false },
         Some("--help") | Some("-h") if args.len() == 1 => CliCommand::Help { explicit: true },
         Some("--list") | Some("-l") if args.len() == 1 => CliCommand::List,
+        Some("--hook") if args.len() == 2 => match args[1].as_str() {
+            "start" => CliCommand::Hook {
+                phase: HookPhase::Start,
+            },
+            "end" => CliCommand::Hook {
+                phase: HookPhase::End,
+            },
+            _ => CliCommand::Help { explicit: false },
+        },
+        Some("--summarize") if args.len() == 2 => CliCommand::Summarize {
+            job: std::path::PathBuf::from(&args[1]),
+        },
         Some(flag) if flag.starts_with('-') => CliCommand::Help { explicit: false },
         Some(query) => CliCommand::Launch {
             query: query.to_string(),
@@ -193,6 +222,66 @@ mod tests {
                 query: "personal".to_string(),
                 claude_args: vec![],
             }
+        );
+    }
+
+    // R7 / design 6: flag form, so an account literally named "hook" still launches.
+    #[test]
+    fn test_should_parse_hook_start_when_hook_flag_given() {
+        assert_eq!(
+            parse_cli_args(&args(&["--hook", "start"])),
+            CliCommand::Hook {
+                phase: HookPhase::Start
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_parse_hook_end_when_hook_flag_given() {
+        assert_eq!(
+            parse_cli_args(&args(&["--hook", "end"])),
+            CliCommand::Hook {
+                phase: HookPhase::End
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_return_usage_error_when_hook_phase_unknown_or_extra() {
+        for a in [
+            &["--hook"][..],
+            &["--hook", "middle"],
+            &["--hook", "start", "x"],
+        ] {
+            assert_eq!(
+                parse_cli_args(&args(a)),
+                CliCommand::Help { explicit: false }
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_launch_account_named_hook_when_no_flag_dashes() {
+        assert_eq!(
+            parse_cli_args(&args(&["hook", "start"])),
+            CliCommand::Launch {
+                query: "hook".to_string(),
+                claude_args: args(&["start"]),
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_parse_summarize_job_when_internal_flag_given() {
+        assert_eq!(
+            parse_cli_args(&args(&["--summarize", "/tmp/job.json"])),
+            CliCommand::Summarize {
+                job: "/tmp/job.json".into()
+            }
+        );
+        assert_eq!(
+            parse_cli_args(&args(&["--summarize"])),
+            CliCommand::Help { explicit: false }
         );
     }
 
