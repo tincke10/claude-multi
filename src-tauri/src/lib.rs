@@ -1,8 +1,10 @@
 pub mod adapters;
 pub mod cli;
+pub mod cms_path;
 pub mod commands;
 pub mod config;
 pub mod hook;
+pub mod hooks_install;
 pub mod inherit;
 pub mod launcher;
 pub mod paths;

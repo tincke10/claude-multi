@@ -6,7 +6,7 @@ use claude_multi_lib::cli::{
     launch_plan, match_account, parse_cli_args, AccountMatchError, CliCommand,
 };
 use claude_multi_lib::config::Config;
-use claude_multi_lib::{hook, inherit, paths, session, summary};
+use claude_multi_lib::{hook, hooks_install, inherit, paths, session, summary};
 use std::process::ExitCode;
 
 fn usage() -> String {
@@ -115,6 +115,18 @@ fn run() -> Result<ExitCode, String> {
                         }
                         return Err(format!("inheriting ~/.claude failed: {}", e.inherit_error));
                     }
+                }
+            }
+
+            // Tracking hooks for this account. KeepExisting: never rewrite an
+            // entry the tray installed. Best-effort, and a no-op when tracking
+            // is off (the tray removes hooks on toggle).
+            if cfg.tracking.enabled {
+                let dir = paths::expand_tilde(&account.config_dir);
+                if let Err(e) =
+                    hooks_install::sync_account(&dir, true, hooks_install::HookPolicy::KeepExisting)
+                {
+                    eprintln!("warning: tracking hooks not installed: {e}");
                 }
             }
 

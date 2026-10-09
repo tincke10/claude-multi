@@ -1,6 +1,7 @@
 use crate::config::{
     apply_inherit_decisions, merge_inherit_overrides, Config, ConfigStore, InheritDecision,
 };
+use crate::hooks_install::{self, HookPolicy};
 use crate::paths::expand_tilde;
 use crate::{adapters, inherit, launcher, session, tracking};
 use serde::Serialize;
@@ -39,10 +40,32 @@ fn prompt_inherit_decision(app: &AppHandle, account_id: &str, subdir: &str) -> I
     }
 }
 
+/// Prepare one account's config dir before launch: inherit `~/.claude`
+/// resources, then (strictly after, so a hook-created settings.json can't block
+/// seeding) sync the tracking hooks. A hook failure never blocks the launch.
+fn ensure_account_inherits(app: &AppHandle, account_id: &str) -> Result<(), String> {
+    inherit_account(app, account_id)?;
+    sync_account_hooks(app, account_id);
+    Ok(())
+}
+
+/// Best-effort install/remove of the tracking hooks for one account. The
+/// tray owns the canonical cms path, so an existing entry is rewritten.
+fn sync_account_hooks(app: &AppHandle, account_id: &str) {
+    let Ok(cfg) = load_config(app) else { return };
+    let Some(account) = cfg.account(account_id) else {
+        return;
+    };
+    let dir = expand_tilde(&account.config_dir);
+    if let Err(e) = hooks_install::sync_account(&dir, cfg.tracking.enabled, HookPolicy::Replace) {
+        eprintln!("tracking hooks sync failed for account '{account_id}': {e}");
+    }
+}
+
 /// Ensure one account's config dir inherits `~/.claude` resources before launch.
 /// Prompts once per unresolved conflict, persists the decision, then re-applies.
 /// No-op (Ok) when `~/.claude` doesn't exist.
-fn ensure_account_inherits(app: &AppHandle, account_id: &str) -> Result<(), String> {
+fn inherit_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
     let source = expand_tilde("~/.claude");
     if !source.is_dir() {
         return Ok(()); // nothing to inherit from
@@ -117,20 +140,37 @@ pub fn get_config(app: AppHandle) -> Result<Config, String> {
     load_config(&app)
 }
 
+/// Returns non-fatal warnings (e.g. tracking hooks that could not be
+/// installed/removed for some accounts); the config itself is always saved
+/// first.
 #[tauri::command]
-pub fn save_config(app: AppHandle, config: Config) -> Result<(), String> {
+pub fn save_config(app: AppHandle, config: Config) -> Result<Vec<String>, String> {
     // Reject before taking the store lock: pure check, nothing to persist yet.
     crate::config::validate_unique_config_dirs(&config)?;
     crate::tracking::validate_tracking(&config.tracking)?;
     // Preferences never edits inherit_overrides: keep whatever is on disk (a
     // tray-prompt decision may have landed since the UI loaded its copy).
-    app.state::<ConfigStore>().update(|disk| {
+    let (was_enabled, now_enabled, dirs) = app.state::<ConfigStore>().update(|disk| {
+        let was_enabled = disk.tracking.enabled;
         *disk = merge_inherit_overrides(config, disk);
-        Ok(())
+        let dirs: Vec<_> = disk
+            .accounts
+            .iter()
+            .map(|a| expand_tilde(&a.config_dir))
+            .collect();
+        Ok((was_enabled, disk.tracking.enabled, dirs))
     })?;
     // Rebuild (after the lock is released) the tray menu so changes apply immediately, no restart needed.
     let _ = crate::tray::refresh_tray(&app);
-    Ok(())
+
+    // Tracking toggled: install/remove hooks for every account. File I/O runs
+    // outside the store lock; failures are reported, never fatal to Save.
+    let warnings = if was_enabled != now_enabled {
+        hooks_install::sync_all(&dirs, now_enabled, HookPolicy::Replace)
+    } else {
+        Vec::new()
+    };
+    Ok(warnings)
 }
 
 #[tauri::command]

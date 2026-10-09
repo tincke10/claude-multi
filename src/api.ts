@@ -42,7 +42,8 @@ export type InheritSubdirStatus = {
 
 // Rejects with the backend error string (e.g. corrupt config.json + backup path).
 export const getConfig = () => invoke<Config>("get_config");
-export const saveConfig = (config: Config) => invoke<void>("save_config", { config });
+// Resolves to non-fatal warnings (e.g. tracking hooks that could not be installed).
+export const saveConfig = (config: Config) => invoke<string[]>("save_config", { config });
 export const listTerminals = () => invoke<TerminalInfo[]>("list_terminals");
 
 export const getInheritStatus = (accountId: string) =>
