@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cm-dashboard",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    // USER-ONLY: fill after creating the Cloudflare Access application.
+    // Empty values make every request fail closed with 500.
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
+    "STALE_AFTER_HOURS": "6"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cm-db",
+      // PLACEHOLDER: same database as cm-ingest (paste the id from `wrangler d1 create cm-db`).
+      // Migrations are owned by ../ingest; this Worker only SELECTs.
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}
