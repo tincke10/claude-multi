@@ -84,6 +84,20 @@ export default function OrcaPanel({ accounts, onImported }: Props) {
     setChecked(next);
   };
 
+  // The first check runs the Orca CLI and a login shell, which takes a few
+  // seconds: show that it is working instead of an empty tab.
+  if (health === null) {
+    return (
+      <section className="card">
+        <div className="card__head">
+          <h2 className="card__title">Orca</h2>
+        </div>
+        {err
+          ? <p className="field-error">Check failed: {err}</p>
+          : <p className="muted">Checking how Orca is set up…</p>}
+      </section>
+    );
+  }
   if (!orcaPanelVisible(health)) return null;
   const checks = health?.checks ?? [];
 
