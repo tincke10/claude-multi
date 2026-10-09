@@ -2,8 +2,9 @@ use crate::config::{
     apply_inherit_decisions, merge_saved_config, Config, ConfigStore, InheritDecision,
 };
 use crate::hooks_install::{self, HookPolicy};
+use crate::overview::{self, AccountOverview};
 use crate::paths::expand_tilde;
-use crate::{adapters, inherit, launcher, session, tracking, tracking_check};
+use crate::{adapters, inherit, launcher, session, tracking, tracking_check, usage};
 use serde::Serialize;
 use std::collections::HashMap;
 use tauri::{AppHandle, Manager};
@@ -477,6 +478,38 @@ pub fn logout_account(app: AppHandle, account_id: String) -> Result<(), String> 
 #[tauri::command]
 pub fn relogin_account(app: AppHandle, account_id: String) -> Result<(), String> {
     run_account_action(&app, &account_id, AccountAction::Relogin)
+}
+
+/// Login status + rolling usage for every account, for the Preferences
+/// Accounts card (the tray menu may be unreachable). Read-only: never creates a
+/// config dir and never opens a terminal. Keychain reads and log scans run on a
+/// blocking thread so the UI thread never stalls.
+#[tauri::command]
+pub async fn accounts_overview(app: AppHandle) -> Result<Vec<AccountOverview>, String> {
+    // Lock-free config read; the probes below can take a while.
+    let cfg = load_config(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = chrono::Utc::now();
+        let session_since = usage::session_window_start(now);
+        let week_since = usage::week_window_start(now);
+        cfg.accounts
+            .iter()
+            .map(|account| {
+                let dir_exists = expand_tilde(&account.config_dir).is_dir();
+                if !dir_exists {
+                    // Nothing to probe: skip the Keychain and the log scan.
+                    let none = session::SessionStatus::LoggedOut { last_email: None };
+                    let empty = usage::UsageSummary::default();
+                    return overview::build_overview(account, &none, false, &empty, &empty);
+                }
+                let status = session::account_session_status(account);
+                let windows = usage::account_usage(account, &[session_since, week_since]);
+                overview::build_overview(account, &status, true, &windows[0], &windows[1])
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Read-only inheritance status for one account, one row per inheritable subdir.
