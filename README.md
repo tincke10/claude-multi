@@ -150,6 +150,7 @@ The `cms` CLI lets you launch Claude Code sessions directly from your terminal â
 ```sh
 cms personal          # fuzzy account matching; "cms pers" also works
 cms dino --resume     # trailing args pass through to claude
+cms --auto            # pick the account from the current directory (see "Using with Orca")
 ```
 
 The account lookup is fuzzy (e.g. `cms pers` matches **Personal**). All inherited resources (`~/.claude` agents, commands, settings) are available just like a tray-launched session. Session state (login gate, Keychain/credentials) is the same: if the account is logged out or expired, the CLI refuses with a login hint.
@@ -159,6 +160,19 @@ The account lookup is fuzzy (e.g. `cms pers` matches **Personal**). All inherite
 **Windows**: Compiling on Windows works (`cargo build --release --bin cms` from `src-tauri/`), but the install script is POSIX-only. After building, add `src-tauri\target\release` to your `PATH` environment variable and run `cms` from any terminal.
 
 ---
+
+## Using with Orca
+
+[Orca](https://github.com/stablyai/orca) runs `claude <args>` inside `zsh -l` in a worktree under `~/orca/workspaces/<project>/<worktree-name>`. `cms --auto` picks the account from that working directory, so each project can use a different Claude account without touching Orca's own account handling.
+
+1. **Put `cms` on the login-shell `PATH`.** Run `npm run install-cli` (installs `~/.local/bin/cms`; make sure your login profile, e.g. `~/.zprofile`, adds that directory to `PATH`), or use the sidecar bundled in the app (`Contents/MacOS/cms`) by symlinking it into a directory already on your `PATH`. Check with `zsh -lc 'command -v cms'`.
+2. **Set the Orca command.** Orca Settings -> Agents -> Claude -> Command = `cms --auto`. Orca appends its default args (e.g. `--dangerously-skip-permissions`); `cms --auto` passes everything after `--auto` to `claude` verbatim.
+3. **Map each project to an account.** In claude-multi Preferences -> Projects, add the project (its repo path) and fill **Worktree roots** with the folder Orca creates worktrees in, e.g. `~/orca/workspaces/<project>` (several roots: one per line or comma-separated). `~` is expanded.
+4. **Verify.** Open an Orca agent in that worktree, then check `echo $CLAUDE_CONFIG_DIR` in its terminal or run `/status` inside Claude Code: it should show the account's `~/.claude-<suffix>` dir and email.
+
+How the match works: the working directory must equal, or be inside, a project path or worktree root (compared by path components, so `/a/foo` does not match `/a/foobar`). The longest match wins; equally specific matches that point to different accounts are an error. If nothing matches, `cms --auto` prints the configured accounts and how to map the folder, then exits non-zero (it never falls back to a default account). It follows the same path as `cms <account>` (login gate, inheritance, tracking hooks) and execs `claude` in-process, so Orca's `ORCA_*` environment is preserved.
+
+Orca's own managed-account switcher is global (not per project): leave it unused or neutral so it does not conflict with the per-project mapping.
 
 ## Terminal selection
 

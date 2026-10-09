@@ -8,6 +8,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cms --auto [claude args...]`**: picks the account from the working
+  directory (project path or the new per-project **Worktree roots** in
+  Preferences, longest match wins) and launches like `cms <account>`. Built for
+  Orca (Settings -> Agents -> Claude -> Command = `cms --auto`); see README
+  "Using with Orca".
 - **Session tracking (opt-in, off by default)**: Preferences -> Tracking points
   sessions at your own Cloudflare backend (`cloud/`: `cm-ingest` + `cm-dashboard`
   Workers on one D1 database, dashboard behind Cloudflare Access) and optionally
