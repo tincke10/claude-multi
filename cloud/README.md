@@ -210,12 +210,15 @@ Tick them once after the first deploy.
 
 ## Free plan limits and watching CPU
 
-Figures below are from Cloudflare's published free-plan limits as I know them
-and **were not re-verified here**; check the current limits page before relying
-on them:
+Figures below were checked on 2026-10-09 against Cloudflare's published pages
+([Workers limits](https://developers.cloudflare.com/workers/platform/limits/),
+[D1 limits](https://developers.cloudflare.com/d1/platform/limits/),
+[D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/)). Limits
+change, so re-check those pages before relying on them:
 
-- Workers Free: 100,000 requests/day and ~10 ms CPU per invocation.
-- D1 Free: 5 M rows read/day, 100 k rows written/day, 5 GB storage.
+- Workers Free: 100,000 requests/day and 10 ms CPU per invocation.
+- D1 Free: 5 M rows read/day, 100 k rows written/day, 500 MB per database,
+  5 GB total storage per account.
 
 Load profile: with tracking on, each running session posts a log batch roughly
 every 5 s (`OTEL_LOGS_EXPORT_INTERVAL=5000`, set by claude-multi) while it has

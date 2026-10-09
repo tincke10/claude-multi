@@ -200,10 +200,15 @@ runbook) and, optionally, to your Grafana Cloud stack. Requires Claude Code
 and public IP plus coarse geo (country/city/ASN, derived server-side by
 Cloudflare), working directory, project label, git branch, start/end time and
 reason, request/tool/error counts, token counts, cost and models used. Claude
-Code's prompt and response text is not requested: claude-multi sets no
-prompt-logging variable (Claude Code redacts prompt content in telemetry unless
-asked otherwise; that default is Claude Code's, not enforced here), and the ingest Worker only reads the numeric/metadata
-fields and stores no raw events.
+Code's prompt and response text is not requested: claude-multi sets none of the
+content-logging variables, and Claude Code leaves them off by default
+(`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`,
+`OTEL_LOG_TOOL_CONTENT` and `OTEL_LOG_RAW_API_BODIES` are all disabled by default
+and the prompt/response text is redacted; see the
+[Claude Code monitoring docs](https://code.claude.com/docs/en/monitoring-usage.md),
+verified 2026-10-09). That default is Claude Code's, not enforced here, so do not
+set those variables in your shell profile if you want it to stay that way. The
+ingest Worker only reads the numeric/metadata fields and stores no raw events.
 
 **AI summary (separate toggle, default off).** When a session ends, claude-multi
 runs `claude -p --resume <transcript> --model haiku` in the background. That call
