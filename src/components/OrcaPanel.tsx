@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import {
   Account, ImportList, OrcaHealth, Project,
   orcaHealth, listOrcaImportCandidates, importOrcaRepos,
-} from "./api";
+} from "../api";
 import {
   isSelectable, levelSymbol, orcaPanelVisible, statusText, summarizeHealth, toSelections,
-} from "./orca";
+} from "../lib/orca";
 
 type Props = {
   accounts: Account[];

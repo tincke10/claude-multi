@@ -1,4 +1,4 @@
-import type { AccountOverview, AccountStatus, UsageView } from "./api";
+import type { AccountOverview, AccountStatus, UsageView } from "../api";
 
 // Compact token count, same rules as the backend's `usage::human_tokens` (the
 // tray): `512`, `340k`, `1.2M`, `5M`.

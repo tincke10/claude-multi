@@ -1,4 +1,4 @@
-import { TrackingConfig } from "./api";
+import { TrackingConfig } from "../api";
 
 // Client-side mirror of the backend's `tracking::validate_tracking`, so Save
 // can be blocked with the same message instead of failing after the click.

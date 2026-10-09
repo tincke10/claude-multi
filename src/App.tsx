@@ -1,282 +1,60 @@
-import { useEffect, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  Account, Config, Project, TerminalInfo, InheritSubdirStatus, InheritDecision, UsageLimits,
-  TrackingConfig, TrackingCheck, AccountOverview, UsageView,
-  getConfig, saveConfig, listTerminals, getInheritStatus, setInheritDecision, testTrackingConnection,
-  accountsOverview, loginAccount, logoutAccount, reloginAccount,
-} from "./api";
-import {
-  AuthAction, ACTION_LABEL, POLL_DELAYS_MS, actionsFor, isSaved, statusPill, usageText,
-} from "./accounts";
-import OrcaPanel from "./OrcaPanel";
-import { appendImported } from "./orca";
-import { trackingProblem } from "./tracking";
-import { parseWorktreeRoots, formatWorktreeRoots, worktreeRootsProblem } from "./worktreeRoots";
+import { orcaHealth } from "./api";
+import Tabs, { TabDef } from "./components/Tabs";
+import SaveBar from "./components/SaveBar";
+import { IN_TAURI, useConfig } from "./hooks/useConfig";
+import { useAccountsOverview } from "./hooks/useAccountsOverview";
+import { useLastTab } from "./hooks/useLastTab";
+import { TabId } from "./lib/lastTab";
+import { orcaPanelVisible } from "./lib/orca";
+import { firstErrorTab, tabErrors } from "./lib/tabErrors";
+import AccountsTab from "./tabs/AccountsTab";
+import ProjectsTab from "./tabs/ProjectsTab";
+import TrackingTab from "./tabs/TrackingTab";
+import OrcaTab from "./tabs/OrcaTab";
+import SettingsTab from "./tabs/SettingsTab";
 import "./App.css";
 
-// Account config dirs always live under `~/.claude-<suffix>` so they stay
-// app-owned and never collide with the default `~/.claude`.
-const CLAUDE_DIR_PREFIX = "~/.claude-";
-const suffixOf = (dir: string) =>
-  dir.startsWith(CLAUDE_DIR_PREFIX) ? dir.slice(CLAUDE_DIR_PREFIX.length) : dir;
-
-// Same normalisation as the backend's `validate_unique_config_dirs`: ignore
-// trailing separators and case (macOS/Windows filesystems are case-insensitive).
-const normalizeSuffix = (dir: string) =>
-  suffixOf(dir).replace(/[\\/]+$/, "").toLowerCase();
-
-// Indices of accounts that share a config dir with another account.
-const duplicateDirIndices = (accounts: Account[]): Set<number> => {
-  const byDir = new Map<string, number[]>();
-  accounts.forEach((a, i) => {
-    const key = normalizeSuffix(a.config_dir);
-    byDir.set(key, [...(byDir.get(key) ?? []), i]);
-  });
-  const dup = new Set<number>();
-  byDir.forEach((idxs) => { if (idxs.length > 1) idxs.forEach((i) => dup.add(i)); });
-  return dup;
+const TAB_LABELS: Record<TabId, string> = {
+  accounts: "Accounts",
+  projects: "Projects",
+  tracking: "Tracking",
+  orca: "Orca",
+  settings: "Settings",
 };
-
-const nextId = (ids: string[], prefix: string) => {
-  const max = ids.reduce((m, id) => {
-    const match = id.match(new RegExp(`^${prefix}(\\d+)$`));
-    return match ? Math.max(m, parseInt(match[1], 10)) : m;
-  }, 0);
-  return `${prefix}${max + 1}`;
-};
-
-// `invoke` only works inside the Tauri webview; in a plain browser the IPC
-// bridge is absent.
-const IN_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-
-// Immutably replace item `i` of an array with a shallow-merged patch.
-function updateAt<T>(arr: T[], i: number, patch: Partial<T>): T[] {
-  return arr.map((item, j) => (j === i ? { ...item, ...patch } : item));
-}
-
-const AUTH_CALLS: Record<AuthAction, (id: string) => Promise<void>> = {
-  login: loginAccount,
-  logout: logoutAccount,
-  relogin: reloginAccount,
-};
-
-// Same key the poller compares: a login/logout/relogin changes status or email.
-const overviewKey = (o: AccountOverview | undefined) => (o ? `${o.status}|${o.email ?? ""}` : "");
-
-function UsageBar({ name, u }: { name: string; u: UsageView }) {
-  return (
-    <div className="usage">
-      <span className="usage__name">{name}</span>
-      <span className="usage__track" aria-hidden="true">
-        {u.percent !== null && (
-          <span
-            className={`usage__fill ${u.percent >= 90 ? "usage__fill--hot" : ""}`}
-            style={{ width: `${u.percent}%` }}
-          />
-        )}
-      </span>
-      <span className="usage__text">{usageText(u)}</span>
-    </div>
-  );
-}
-
-function AccountStatusRow(props: {
-  overview: AccountOverview | undefined;
-  saved: boolean;
-  loaded: boolean;
-  busy: boolean;
-  error: string | undefined;
-  onAction: (a: AuthAction) => void;
-}) {
-  const { overview: o, saved, loaded, busy, error, onAction } = props;
-  if (!saved || !o) {
-    return (
-      <div className="row account__status">
-        <span className="muted">{loaded ? "Save first to log in and see usage." : "Checking…"}</span>
-      </div>
-    );
-  }
-  const pill = statusPill(o);
-  return (
-    <>
-      <div className="row account__status">
-        <span className={`pill pill--${pill.tone}`}>{pill.text}</span>
-        <span className="row__grow" />
-        {actionsFor(o.status).map((act) => (
-          <button
-            key={act}
-            className="btn btn--secondary btn--compact"
-            disabled={busy}
-            onClick={() => onAction(act)}
-          >{ACTION_LABEL[act]}</button>
-        ))}
-      </div>
-      {error && <p className="field-error">{error}</p>}
-      <UsageBar name="Session (5h)" u={o.session} />
-      <UsageBar name="Week (7d)" u={o.week} />
-    </>
-  );
-}
 
 export default function App() {
-  const [config, setConfig] = useState<Config | null>(null);
-  const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
-  const [status, setStatus] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  // Inheritance panel: which account is inspected + its fetched per-subdir rows.
-  const [inheritAccount, setInheritAccount] = useState<string>("");
-  const [inheritRows, setInheritRows] = useState<InheritSubdirStatus[]>([]);
-  const [inheritErr, setInheritErr] = useState<string | null>(null);
-  // Tracking: non-fatal warnings from the last save + the last connection test.
-  const [saveWarnings, setSaveWarnings] = useState<string[]>([]);
-  const [check, setCheck] = useState<TrackingCheck | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [checkErr, setCheckErr] = useState<string | null>(null);
-  // Raw worktree-roots text per project id (see `setRoots`).
-  const [rootsDrafts, setRootsDrafts] = useState<Record<string, string>>({});
-
-  // Accounts card: login status + usage, refreshed on mount, Save, focus and
-  // (polled) after an auth action, since logins finish in an external terminal.
-  const [overview, setOverview] = useState<AccountOverview[]>([]);
-  const [overviewLoaded, setOverviewLoaded] = useState(false);
-  const [overviewErr, setOverviewErr] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const [actionErrs, setActionErrs] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState<Set<string>>(new Set());
-  const mounted = useRef(true);
-  const overviewRef = useRef<AccountOverview[]>([]);
-  const pollTimers = useRef<Map<string, number>>(new Map());
-
-  const refreshOverview = async (): Promise<AccountOverview[] | null> => {
-    setRefreshing(true);
-    try {
-      const rows = await accountsOverview();
-      if (!mounted.current) return null;
-      overviewRef.current = rows;
-      setOverview(rows);
-      setOverviewLoaded(true);
-      setOverviewErr(null);
-      return rows;
-    } catch (e) {
-      if (mounted.current) setOverviewErr(`${e}`);
-      return null;
-    } finally {
-      if (mounted.current) setRefreshing(false);
-    }
-  };
-
-  const stopPolling = (id: string) => {
-    const t = pollTimers.current.get(id);
-    if (t !== undefined) window.clearTimeout(t);
-    pollTimers.current.delete(id);
-  };
-
-  // Re-read the overview with growing delays (~2 min) until this account's
-  // status/email differs from `prevKey`, then stop.
-  const startPolling = (id: string, prevKey: string) => {
-    stopPolling(id);
-    let step = 0;
-    const schedule = () => {
-      if (step >= POLL_DELAYS_MS.length) { pollTimers.current.delete(id); return; }
-      pollTimers.current.set(id, window.setTimeout(tick, POLL_DELAYS_MS[step++]));
-    };
-    const tick = async () => {
-      const rows = await refreshOverview();
-      if (!mounted.current) return;
-      if (overviewKey(rows?.find((r) => r.id === id)) !== prevKey && rows !== null) {
-        pollTimers.current.delete(id);
-        return;
-      }
-      schedule();
-    };
-    schedule();
-  };
-
-  const runAuthAction = async (id: string, action: AuthAction) => {
-    const prevKey = overviewKey(overviewRef.current.find((r) => r.id === id));
-    setBusy((b) => new Set(b).add(id));
-    setActionErrs((m) => { const { [id]: _drop, ...rest } = m; return rest; });
-    try {
-      await AUTH_CALLS[action](id);
-      startPolling(id, prevKey);
-    } catch (e) {
-      setActionErrs((m) => ({ ...m, [id]: `${e}` }));
-    } finally {
-      setBusy((b) => { const n = new Set(b); n.delete(id); return n; });
-    }
-  };
+  const ov = useAccountsOverview();
+  const cfgState = useConfig(() => { void ov.refresh(); });
+  const [storedTab, setTab] = useLastTab();
+  // The Orca tab only exists when the backend supports it and Orca is installed.
+  const [orcaVisible, setOrcaVisible] = useState(false);
 
   useEffect(() => {
-    mounted.current = true;
-    const timers = pollTimers.current;
-    if (IN_TAURI) void refreshOverview();
-    return () => {
-      mounted.current = false;
-      timers.forEach((t) => window.clearTimeout(t));
-      timers.clear();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (!IN_TAURI) return;
+    let alive = true;
+    orcaHealth()
+      .then((h) => { if (alive) setOrcaVisible(orcaPanelVisible(h)); })
+      .catch(() => { /* the panel is optional; leave the tab hidden */ });
+    return () => { alive = false; };
   }, []);
-
-  useEffect(() => {
-    if (!IN_TAURI) {
-      setLoadError("Open this window from the claude-multi tray icon (run `npm run tauri dev`). It can't run in a plain browser.");
-      return;
-    }
-    (async () => {
-      try {
-        const [cfg, terms] = await Promise.all([getConfig(), listTerminals()]);
-        // Heal projects whose account is empty or points at a removed account
-        // (e.g. migrated from the old default_account field): assign them to the
-        // first account so they aren't silently invisible in the tray.
-        const validIds = new Set(cfg.accounts.map((a) => a.id));
-        const firstId = cfg.accounts[0]?.id ?? "";
-        // Legacy projects may predate worktree_roots; default it so the input binds.
-        const projects = cfg.projects.map((p) => ({
-          ...p,
-          worktree_roots: p.worktree_roots ?? [],
-          account: validIds.has(p.account) ? p.account : firstId,
-        }));
-        // Legacy accounts may predate usage_limits; default it so the inputs bind.
-        const accounts = cfg.accounts.map((a) => ({
-          ...a,
-          usage_limits: a.usage_limits ?? { session_tokens: null, weekly_tokens: null },
-          inherit_overrides: a.inherit_overrides ?? {},
-        }));
-        setConfig({ ...cfg, accounts, projects });
-        setInheritAccount(firstId);
-        setTerminals(terms);
-      } catch (e) {
-        setLoadError(`Failed to load config: ${e}`);
-      }
-    })();
-  }, []);
-
-  // Auto-refresh the inheritance status whenever the inspected account changes.
-  useEffect(() => {
-    if (!IN_TAURI || !inheritAccount) {
-      setInheritRows([]);
-      return;
-    }
-    let cancelled = false;
-    getInheritStatus(inheritAccount)
-      .then((rows) => { if (!cancelled) { setInheritRows(rows); setInheritErr(null); } })
-      .catch((e) => { if (!cancelled) { setInheritErr(`${e}`); setInheritRows([]); } });
-    return () => { cancelled = true; };
-  }, [inheritAccount]);
 
   // The window is hidden (not destroyed) on close, so this component persists.
-  // Clear any stale status message each time the window regains focus.
+  // Clear any stale status message and re-read the overview on focus.
+  const { clearStatus } = cfgState;
+  const { refresh } = ov;
   useEffect(() => {
     if (!IN_TAURI) return;
     let unlisten: (() => void) | undefined;
     getCurrentWindow()
-      .onFocusChanged(({ payload: focused }) => { if (focused) { setStatus(null); setSaveWarnings([]); void refreshOverview(); } })
+      .onFocusChanged(({ payload: focused }) => { if (focused) { clearStatus(); void refresh(); } })
       .then((u) => { unlisten = u; });
     return () => unlisten?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const { config, loadError } = cfgState;
 
   if (loadError) {
     return (
@@ -289,120 +67,15 @@ export default function App() {
       </div>
     );
   }
-
   if (!config) return <div className="app"><p className="muted">Loading…</p></div>;
 
-  // Narrow once so the closures below operate on a non-null Config.
-  const cfg: Config = config;
-  const patch = (next: Partial<Config>) => setConfig({ ...cfg, ...next });
-  // Accounts sharing a config dir would break isolation: flag them, block Save.
-  const dupDirs = duplicateDirIndices(cfg.accounts);
-  const setAccounts = (accounts: Account[]) => patch({ accounts });
-  const setProjects = (projects: Project[]) => patch({ projects });
-  const setTracking = (u: Partial<TrackingConfig>) => {
-    patch({ tracking: { ...cfg.tracking, ...u } });
-    setCheck(null); // a result for the old values would mislead
-    setCheckErr(null);
-  };
-  const trackingErr = trackingProblem(cfg.tracking);
-  // Worktree-roots drafts: the textarea keeps the raw text (a trailing comma
-  // must survive typing) while the config holds the parsed list.
-  const rootsDraft = (p: Project) => rootsDrafts[p.id] ?? formatWorktreeRoots(p.worktree_roots);
-  const rootsErrors = cfg.projects.map((p) => worktreeRootsProblem(p.worktree_roots));
-  const hasRootsErr = rootsErrors.some((e) => e !== null);
-  const setRoots = (i: number, raw: string) => {
-    setRootsDrafts({ ...rootsDrafts, [cfg.projects[i].id]: raw });
-    setProjects(updateAt(cfg.projects, i, { worktree_roots: parseWorktreeRoots(raw) }));
-  };
-  const canTest = cfg.tracking.ingest_url.trim() !== "" && cfg.tracking.ingest_token !== "";
-  // Patch one account's usage ceilings immutably.
-  const setAccountLimits = (i: number, u: Partial<UsageLimits>) =>
-    setAccounts(updateAt(cfg.accounts, i, { usage_limits: { ...cfg.accounts[i].usage_limits, ...u } }));
-
-  // Parse a token-ceiling input: empty ⇒ null (unset); otherwise a non-negative
-  // integer, ignoring anything that isn't a clean number.
-  const parseCeiling = (raw: string): number | null => {
-    const t = raw.trim();
-    if (t === "") return null;
-    const n = Number(t);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
-  };
-
-  const addAccount = () => {
-    const id = nextId(cfg.accounts.map((a) => a.id), "a");
-    setAccounts([...cfg.accounts, {
-      id, label: "New account", config_dir: `${CLAUDE_DIR_PREFIX}new`,
-      inherit_overrides: {},
-      usage_limits: { session_tokens: null, weekly_tokens: null },
-    }]);
-  };
-
-  const addProject = () => {
-    const id = nextId(cfg.projects.map((p) => p.id), "p");
-    setProjects([...cfg.projects, { id, label: "", path: "", account: cfg.accounts[0]?.id ?? "", worktree_roots: [] }]);
-  };
-
-  const browseProject = async (i: number) => {
-    const dir = await open({ directory: true, multiple: false });
-    if (typeof dir !== "string") return; // cancelled
-    const current = cfg.projects[i];
-    const folderName = dir.split(/[\\/]/).pop() || current.label; // handle / and \
-    const labelIsDefault = current.label.trim() === "" || /^Project \d+$/.test(current.label);
-    setProjects(updateAt(cfg.projects, i, { path: dir, label: labelIsDefault ? folderName : current.label }));
-  };
-
-  // Persist a Merge/Skip decision for one subdir, then re-fetch to reflect it.
-  const onInheritToggle = async (subdir: string, decision: InheritDecision) => {
-    try {
-      await setInheritDecision(inheritAccount, subdir, decision);
-      // Mirror the persisted decision locally so a later Save doesn't send a stale map.
-      setConfig((c) => c && {
-        ...c,
-        accounts: c.accounts.map((a) =>
-          a.id === inheritAccount
-            ? { ...a, inherit_overrides: { ...a.inherit_overrides, [subdir]: decision } }
-            : a),
-      });
-      setInheritRows(await getInheritStatus(inheritAccount));
-      setInheritErr(null);
-    } catch (e) {
-      setInheritErr(`${e}`);
-    }
-  };
-
-  const runCheck = async () => {
-    setChecking(true);
-    setCheck(null);
-    setCheckErr(null);
-    try {
-      setCheck(await testTrackingConnection(cfg.tracking));
-    } catch (e) {
-      setCheckErr(`${e}`);
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  const save = async () => {
-    try {
-      const warnings = await saveConfig(cfg);
-      setSaveWarnings(warnings);
-      void refreshOverview();
-      // Re-fetch tracking so freshly typed tokens go back to the mask: the
-      // plain value must not linger in UI state after it is stored.
-      const fresh = await getConfig();
-      setConfig((c) => c && { ...c, tracking: fresh.tracking });
-      setStatus({
-        kind: "ok",
-        text: warnings.length > 0
-          ? `Saved with ${warnings.length} warning(s) — see Tracking.`
-          : "Saved — the tray menu was updated.",
-      });
-      window.setTimeout(() => setStatus(null), 3000);
-    } catch (e) {
-      setStatus({ kind: "err", text: `Save failed: ${e}` });
-    }
-  };
+  const errors = tabErrors(config);
+  const errorTab = firstErrorTab(errors);
+  const tabs: TabDef[] = (Object.keys(TAB_LABELS) as TabId[])
+    .filter((id) => id !== "orca" || orcaVisible)
+    .map((id) => ({ id, label: TAB_LABELS[id], error: errors[id] !== null }));
+  // A remembered Orca tab falls back to Accounts when Orca isn't available.
+  const active: TabId = tabs.some((t) => t.id === storedTab) ? storedTab : "accounts";
 
   return (
     <div className="app">
@@ -411,339 +84,35 @@ export default function App() {
         <p className="app__subtitle">Preferences</p>
       </header>
 
-      <section className="card">
-        <h2 className="card__title">Terminal</h2>
-        <p className="card__hint">Which terminal the tray opens for sessions and logins.</p>
-        <select
-          className="select"
-          value={cfg.terminal}
-          onChange={(e) => patch({ terminal: e.target.value })}
-        >
-          {terminals.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
-        </select>
-      </section>
+      <Tabs tabs={tabs} active={active} onSelect={setTab} />
 
-      <section className="card">
-        <div className="card__head">
-          <h2 className="card__title">Accounts</h2>
-          <div className="card__actions">
-            <button
-              className="btn btn--icon btn--refresh"
-              title="Refresh login status and usage"
-              aria-label="Refresh login status and usage"
-              onClick={() => void refreshOverview()}
-              disabled={refreshing}
-            >↻</button>
-            <button className="btn btn--ghost" onClick={addAccount}>+ Add account</button>
-          </div>
-        </div>
-        <p className="card__hint">
-          Each account is isolated in its own <code>{CLAUDE_DIR_PREFIX}…</code> config directory.
-          The tray shows its rolling token usage — <code>Session (5h)</code> and{" "}
-          <code>Week (7d)</code>. Set an approximate per-account token ceiling to see{" "}
-          <code>used / ceiling · %</code> (plans differ, so a work account may allow more than a
-          personal one). There's no local source for Anthropic's real limits, so calibrate: when
-          {" "}<code>/usage</code> shows e.g. 13% used, the ceiling ≈ current tokens ÷ 0.13. Leave
-          blank to show raw tokens.
-        </p>
-
-        {overviewErr && <p className="field-error">Couldn't read account status: {overviewErr}</p>}
-        {cfg.accounts.length === 0 && <p className="muted">No accounts yet.</p>}
-        {cfg.accounts.map((a, i) => (
-          <div className="account" key={a.id}>
-            <div className="row">
-              <input
-                className="input row__grow"
-                placeholder="Label (e.g. Personal)"
-                value={a.label}
-                onChange={(e) => setAccounts(updateAt(cfg.accounts, i, { label: e.target.value }))}
-              />
-              <span className={`affix ${dupDirs.has(i) ? "affix--invalid" : ""}`}>
-                <span className="affix__prefix">{CLAUDE_DIR_PREFIX}</span>
-                <input
-                  className="input affix__input"
-                  placeholder="suffix"
-                  value={suffixOf(a.config_dir)}
-                  onChange={(e) =>
-                    setAccounts(updateAt(cfg.accounts, i, { config_dir: CLAUDE_DIR_PREFIX + e.target.value }))
-                  }
-                />
-              </span>
-              <button
-                className="btn btn--icon"
-                title="Remove account"
-                onClick={() => setAccounts(cfg.accounts.filter((_, j) => j !== i))}
-              >✕</button>
-            </div>
-            {dupDirs.has(i) && (
-              <p className="field-error">
-                Another account already uses <code>{a.config_dir}</code>. Each account needs its own config directory.
-              </p>
-            )}
-            <AccountStatusRow
-              overview={overview.find((o) => o.id === a.id)}
-              saved={isSaved(overview.find((o) => o.id === a.id), a.id, a.config_dir)}
-              loaded={overviewLoaded}
-              busy={busy.has(a.id)}
-              error={actionErrs[a.id]}
-              onAction={(act) => void runAuthAction(a.id, act)}
-            />
-            <div className="row account__limits">
-              <label className="field">
-                <span className="field__label">Session (5h) ceiling</span>
-                <input
-                  className="input"
-                  type="number"
-                  min={0}
-                  placeholder="tokens, e.g. 5000000"
-                  value={a.usage_limits.session_tokens ?? ""}
-                  onChange={(e) => setAccountLimits(i, { session_tokens: parseCeiling(e.target.value) })}
-                />
-              </label>
-              <label className="field">
-                <span className="field__label">Week (7d) ceiling</span>
-                <input
-                  className="input"
-                  type="number"
-                  min={0}
-                  placeholder="tokens, e.g. 40000000"
-                  value={a.usage_limits.weekly_tokens ?? ""}
-                  onChange={(e) => setAccountLimits(i, { weekly_tokens: parseCeiling(e.target.value) })}
-                />
-              </label>
-            </div>
-          </div>
-        ))}
-      </section>
-
-      <section className="card">
-        <div className="card__head">
-          <h2 className="card__title">Inheritance</h2>
-          {cfg.accounts.length > 0 && (
-            <select
-              className="select"
-              value={inheritAccount}
-              onChange={(e) => setInheritAccount(e.target.value)}
-            >
-              {cfg.accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-            </select>
-          )}
-        </div>
-        <p className="card__hint">Shared resources from <code>~/.claude</code> linked into each account. Toggle whether each subdir is merged in or skipped.</p>
-
-        {cfg.accounts.length === 0 && <p className="muted">Add an account to see what it inherits.</p>}
-        {inheritErr && <p className="banner banner--err">{inheritErr}</p>}
-        {cfg.accounts.length > 0 && inheritRows.map((r) => {
-          const mergeOn = r.decision === "merge" || (r.decision === null && r.status === "inherited");
-          const skipOn = r.decision === "skip";
-          return (
-            <div className="row inherit-row" key={r.subdir}>
-              <code className="inherit-row__name">{r.subdir}</code>
-              <span className={`badge badge--${r.status}`}>{r.status}</span>
-              {r.status !== "none" && (
-                <span className="toggle">
-                  <button
-                    className={`toggle__btn ${mergeOn ? "toggle__btn--on" : ""}`}
-                    onClick={() => onInheritToggle(r.subdir, "merge")}
-                  >Merge</button>
-                  <button
-                    className={`toggle__btn ${skipOn ? "toggle__btn--on" : ""}`}
-                    onClick={() => onInheritToggle(r.subdir, "skip")}
-                  >Skip</button>
-                </span>
-              )}
-            </div>
-          );
-        })}
-        <p className="card__hint inherit-note"><code>plugins</code> — excluded by design.</p>
-      </section>
-
-      <section className="card">
-        <div className="card__head">
-          <h2 className="card__title">Projects</h2>
-          <button className="btn btn--ghost" onClick={addProject} disabled={cfg.accounts.length === 0}>+ Add project</button>
-        </div>
-        <p className="card__hint">Each project belongs to one account and appears only under that account in the tray.</p>
-
-        {cfg.projects.length === 0 && <p className="muted">No projects yet. Add one and pick a folder.</p>}
-        {cfg.projects.map((p, i) => (
-          <div className="project" key={p.id}>
-          <div className="row">
-            <input
-              className="input row__label"
-              placeholder="Label"
-              value={p.label}
-              onChange={(e) => setProjects(updateAt(cfg.projects, i, { label: e.target.value }))}
-            />
-            <input
-              className="input row__grow"
-              placeholder="/path/to/repo"
-              value={p.path}
-              onChange={(e) => setProjects(updateAt(cfg.projects, i, { path: e.target.value }))}
-            />
-            <button className="btn btn--secondary" onClick={() => browseProject(i)}>Browse…</button>
-            <select
-              className="select"
-              value={p.account}
-              onChange={(e) => setProjects(updateAt(cfg.projects, i, { account: e.target.value }))}
-            >
-              {!cfg.accounts.some((a) => a.id === p.account) && (
-                <option value="">— account —</option>
-              )}
-              {cfg.accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-            </select>
-            <button
-              className="btn btn--icon"
-              title="Remove project"
-              onClick={() => setProjects(cfg.projects.filter((_, j) => j !== i))}
-            >✕</button>
-          </div>
-          <textarea
-            className="input project__roots"
-            rows={2}
-            placeholder="Worktree roots (optional) — e.g. ~/orca/workspaces/my-project, one per line or comma-separated"
-            value={rootsDraft(p)}
-            onChange={(e) => setRoots(i, e.target.value)}
+      <div id="tabpanel" role="tabpanel" aria-labelledby={`tab-${active}`}>
+        {active === "accounts" && (
+          <AccountsTab
+            config={config}
+            snapshot={cfgState.snapshot}
+            patch={cfgState.patch}
+            accountsOverview={ov}
           />
-          {rootsErrors[i] && <p className="field-error">{rootsErrors[i]}</p>}
-          </div>
-        ))}
-      </section>
-
-      {IN_TAURI && (
-        <OrcaPanel
-          accounts={cfg.accounts}
-          onImported={(added) =>
-            setConfig((c) => c && { ...c, projects: appendImported(c.projects, added) })}
-        />
-      )}
-
-      <section className="card">
-        <div className="card__head">
-          <h2 className="card__title">Tracking</h2>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={cfg.tracking.enabled}
-              onChange={(e) => setTracking({ enabled: e.target.checked })}
-            />
-            <span>Enabled</span>
-          </label>
-        </div>
-        <p className="card__hint">
-          Opt-in. Reports session activity (counts, tokens, cost — never prompt text) to your own{" "}
-          <code>cm-ingest</code> Worker, and metrics to Grafana Cloud. Requires Claude Code 2.1.212 or newer.
-        </p>
-
-        <label className="field field--stack">
-          <span className="field__label">Ingest URL</span>
-          <input
-            className="input"
-            placeholder="https://cm-ingest.<you>.workers.dev"
-            value={cfg.tracking.ingest_url}
-            onChange={(e) => setTracking({ ingest_url: e.target.value })}
-          />
-        </label>
-        <label className="field field--stack">
-          <span className="field__label">Ingest token</span>
-          <input
-            className="input"
-            type="password"
-            autoComplete="off"
-            value={cfg.tracking.ingest_token}
-            onFocus={(e) => e.target.select()}
-            onChange={(e) => setTracking({ ingest_token: e.target.value })}
-          />
-        </label>
-
-        <p className="card__hint card__hint--sub">Grafana Cloud metrics (optional)</p>
-        <label className="field field--stack">
-          <span className="field__label">OTLP endpoint</span>
-          <input
-            className="input"
-            placeholder="https://otlp-gateway-<zone>.grafana.net/otlp"
-            value={cfg.tracking.grafana_otlp_endpoint}
-            onChange={(e) => setTracking({ grafana_otlp_endpoint: e.target.value })}
-          />
-        </label>
-        <div className="row">
-          <label className="field">
-            <span className="field__label">Instance ID</span>
-            <input
-              className="input"
-              value={cfg.tracking.grafana_instance_id}
-              onChange={(e) => setTracking({ grafana_instance_id: e.target.value })}
-            />
-          </label>
-          <label className="field">
-            <span className="field__label">Access token</span>
-            <input
-              className="input"
-              type="password"
-              autoComplete="off"
-              value={cfg.tracking.grafana_token}
-              onFocus={(e) => e.target.select()}
-              onChange={(e) => setTracking({ grafana_token: e.target.value })}
-            />
-          </label>
-        </div>
-
-        <label className="check check--block">
-          <input
-            type="checkbox"
-            checked={cfg.tracking.summaries}
-            onChange={(e) => setTracking({ summaries: e.target.checked })}
-          />
-          <span>AI summary when a session ends <span className="muted">(runs a small Claude call per session; uses your quota)</span></span>
-        </label>
-
-        {trackingErr && <p className="field-error">{trackingErr}</p>}
-
-        <div className="row tracking__test">
-          <button className="btn btn--secondary" onClick={runCheck} disabled={!canTest || checking}>
-            {checking ? "Testing…" : "Test connection"}
-          </button>
-          <span className="muted">Uses the values above; saved tokens stay masked.</span>
-        </div>
-        {checkErr && <p className="field-error">Test failed: {checkErr}</p>}
-        {check && (
-          <ul className="check-result">
-            <li className={check.ingest_ok ? "check-result--ok" : "check-result--err"}>
-              Ingest: {check.ingest_message}
-            </li>
-            {check.grafana_ok !== null && (
-              <li className={check.grafana_ok ? "check-result--ok" : "check-result--err"}>
-                Grafana: {check.grafana_message}
-              </li>
-            )}
-            {check.warnings.map((w) => (
-              <li key={w} className="check-result--warn">{w}</li>
-            ))}
-          </ul>
         )}
-        {saveWarnings.length > 0 && (
-          <div className="banner banner--warn">
-            <strong>Saved, but:</strong>
-            <ul className="banner__list">
-              {saveWarnings.map((w) => <li key={w}>{w}</li>)}
-            </ul>
-          </div>
+        {active === "projects" && (
+          <ProjectsTab config={config} patch={cfgState.patch} applyPersisted={cfgState.applyPersisted} />
         )}
-      </section>
+        {active === "tracking" && (
+          <TrackingTab config={config} patch={cfgState.patch} saveWarnings={cfgState.saveWarnings} />
+        )}
+        {active === "orca" && <OrcaTab config={config} applyPersisted={cfgState.applyPersisted} />}
+        {active === "settings" && (
+          <SettingsTab config={config} terminals={cfgState.terminals} patch={cfgState.patch} />
+        )}
+      </div>
 
-      <footer className="app__footer">
-        <button className="btn btn--primary" onClick={save} disabled={dupDirs.size > 0 || trackingErr !== null || hasRootsErr}>Save</button>
-        {dupDirs.size > 0 && (
-          <span className="status status--err">Fix the duplicate account config directories to save.</span>
-        )}
-        {hasRootsErr && dupDirs.size === 0 && (
-          <span className="status status--err">Fix the worktree roots to save.</span>
-        )}
-        {trackingErr && dupDirs.size === 0 && !hasRootsErr && (
-          <span className="status status--err">Fix the Tracking settings to save.</span>
-        )}
-        {status && <span className={`status status--${status.kind}`}>{status.text}</span>}
-      </footer>
+      <SaveBar
+        dirty={cfgState.dirty}
+        errorTabLabel={errorTab === null ? null : TAB_LABELS[errorTab]}
+        status={cfgState.status}
+        onSave={() => void cfgState.save()}
+      />
     </div>
   );
 }

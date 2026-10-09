@@ -394,3 +394,37 @@ body {
 .usage__fill { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
 .usage__fill--hot { background: var(--warn); }
 .usage__text { flex: 0 0 auto; min-width: 130px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Tabs (Phase 1 shell; restyled in the visual-system phase) */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.tabs__tab {
+  position: relative;
+  padding: 8px 14px;
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.tabs__tab:hover { color: var(--text); }
+.tabs__tab--active {
+  color: var(--text);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.tabs__dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+  vertical-align: middle;
+}
