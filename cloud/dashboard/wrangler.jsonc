@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "cm-dashboard",
+  "account_id": "4982f30e5231e1f679c1fc2e2c436f39",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-10-09",
   "compatibility_flags": ["nodejs_compat"],
@@ -22,9 +23,9 @@
     {
       "binding": "DB",
       "database_name": "cm-db",
-      // PLACEHOLDER: same database as cm-ingest (paste the id from `wrangler d1 create cm-db`).
+      // Same database as cm-ingest.
       // Migrations are owned by ../ingest; this Worker only SELECTs.
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "7ab4513a-edbb-476d-9464-62888d341c4b"
     }
   ]
 }

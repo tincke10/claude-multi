@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "cm-ingest",
+  "account_id": "4982f30e5231e1f679c1fc2e2c436f39",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-09",
   "compatibility_flags": ["nodejs_compat"],
@@ -14,8 +15,7 @@
     {
       "binding": "DB",
       "database_name": "cm-db",
-      // PLACEHOLDER: run `wrangler d1 create cm-db` (USER-ONLY) and paste the real id here.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "7ab4513a-edbb-476d-9464-62888d341c4b",
       "migrations_dir": "../migrations"
     }
   ],
