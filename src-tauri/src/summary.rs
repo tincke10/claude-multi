@@ -739,6 +739,95 @@ mod tests {
         assert!(!jp.exists());
     }
 
+    fn run_with_tracking(t: TrackingConfig) -> (Option<Delivery>, usize, usize) {
+        let rig = Rig::new();
+        let jp = rig.job_file(false);
+        let cfg = Config {
+            tracking: t,
+            ..Config::default()
+        };
+        let runner = |c: &SummaryCommand| {
+            rig.ran.borrow_mut().push(c.clone());
+            ok_run()
+        };
+        let send = |b: &str| {
+            rig.sent.borrow_mut().push(b.to_string());
+            SendOutcome::Status(204)
+        };
+        let out = process_job(
+            &jp,
+            &cfg,
+            &rig.dir.path().join("spool"),
+            50,
+            Vec::<String>::new(),
+            &runner,
+            &send,
+        );
+        let counts = (rig.ran.borrow().len(), rig.sent.borrow().len());
+        (out, counts.0, counts.1)
+    }
+
+    #[test]
+    fn test_should_not_run_claude_when_summaries_off_or_ingest_url_empty() {
+        let base = TrackingConfig {
+            enabled: true,
+            summaries: true,
+            ingest_url: "https://i".into(),
+            ingest_token: "t".into(),
+            ..TrackingConfig::default()
+        };
+        // Control: the full config does run and post.
+        assert_eq!(
+            run_with_tracking(base.clone()),
+            (Some(Delivery::Sent), 1, 1)
+        );
+        let no_summaries = TrackingConfig {
+            summaries: false,
+            ..base.clone()
+        };
+        assert_eq!(run_with_tracking(no_summaries), (None, 0, 0));
+        let no_url = TrackingConfig {
+            ingest_url: String::new(),
+            ..base
+        };
+        assert_eq!(run_with_tracking(no_url), (None, 0, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_drop_inherited_vars_listed_in_env_remove_when_command_runs() {
+        // Unique name: no other test reads or writes it.
+        let key = "OTEL_CMS_SUMMARY_EDGE_TEST";
+        std::env::set_var(key, "leaked");
+        let cmd = SummaryCommand {
+            program: "sh".into(),
+            args: vec!["-c".into(), format!("printf '%s' \"${{{key}-unset}}\"")],
+            cwd: None,
+            env: vec![],
+            env_remove: vec![key.to_string()],
+        };
+        let out = run_command(&cmd, Duration::from_secs(10));
+        std::env::remove_var(key);
+        assert_eq!(
+            out,
+            RunResult::Exited {
+                code: Some(0),
+                stdout: "unset".into(),
+                stderr: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_keep_caps_aligned_with_ingest_and_design_timeout() {
+        // cloud/ingest/src/events.ts caps summary at 4000 and error at 1000;
+        // design 6 kills the run after 300 s.
+        assert_eq!(MAX_SUMMARY_CHARS, 4000);
+        assert_eq!(MAX_ERROR_CHARS, 1000);
+        assert_eq!(SUMMARY_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(job_file_name(&"a".repeat(500)).len(), 100 + ".json".len());
+    }
+
     #[test]
     fn test_should_spool_summary_when_post_fails() {
         let rig = Rig::new();
