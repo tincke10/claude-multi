@@ -188,11 +188,59 @@ If the configured terminal can't be opened, the app copies a manual command to t
 
 ---
 
+## Session tracking (opt-in)
+
+**Off by default.** When enabled in **Preferences… → Tracking**, sessions launched
+from the tray or `cms` report to a backend **you deploy to your own Cloudflare
+account** (`cloud/`, see [`cloud/README.md`](cloud/README.md) for the full setup
+runbook) and, optionally, to your Grafana Cloud stack. Requires Claude Code
+**2.1.212 or newer**.
+
+**What is collected** (metadata only): per session the account, host, OS, local
+and public IP plus coarse geo (country/city/ASN, derived server-side by
+Cloudflare), working directory, project label, git branch, start/end time and
+reason, request/tool/error counts, token counts, cost and models used. Claude
+Code's prompt and response text is not requested: claude-multi sets no
+prompt-logging variable (Claude Code redacts prompt content in telemetry unless
+asked otherwise; that default is Claude Code's, not enforced here), and the ingest Worker only reads the numeric/metadata
+fields and stores no raw events.
+
+**AI summary (separate toggle, default off).** When a session ends, claude-multi
+runs `claude -p --resume <transcript> --model haiku` in the background. That call
+**reads the session transcript (your prompts and the responses) and sends it to
+Anthropic**, so the resulting text lands in your D1 database, and it **consumes
+tokens of the same account** that ran the session. There is no token cap
+(`--max-turns 1`, 300 s timeout). Leave it off if the content is sensitive or
+the account has tight limits.
+
+**Where secrets live.** The ingest token and Grafana token are stored in
+`config.json` (`0600` on Unix), are never sent to the Preferences UI (it only
+sees a mask), and are never put in the "copy manual command" clipboard
+fallbacks. To make Claude Code export telemetry they must reach the session:
+they are written into the ephemeral launch script (`0700`, atomic, unguessable
+name, same-user only) and into the `claude` process environment, so another
+process of the same user can read them. Treat the tokens as same-user secrets
+and use scoped, rotatable ones.
+
+**Hooks.** Enabling tracking adds `SessionStart`/`SessionEnd` entries (calling
+`cms --hook`) to each account's `<config_dir>/settings.json`. Your own hooks and
+keys are preserved, and the file is never written if it is a symlink or inside
+the default `~/.claude`.
+
+**Disable.** Untick **Enabled** and Save: telemetry env vars stop being injected
+on the next launch (already-running sessions keep theirs until they end) and
+the hook entries are removed from every account's `settings.json` (only those
+claude-multi added). Failed deliveries are spooled locally (capped at 500) and
+flushed later; the hook always exits 0 and never blocks Claude Code.
+
+---
+
 ## Security model
 
 - The app **only** reads/writes the per-account `~/.claude-<suffix>` dirs you configure — **never** the default `~/.claude`.
 - Launch scripts shell-escape the config dir and project path (POSIX `'\''`, PowerShell `''`).
 - Temp scripts are created atomically with restrictive permissions and unguessable names (`tempfile`).
+- With Tracking on, those scripts and the session environment carry the tracking tokens (see "Session tracking").
 
 ---
 
@@ -233,10 +281,12 @@ So **each platform builds its own** — clone the repo and run the command on ma
 ```sh
 APP=src-tauri/target/release/bundle/macos/claude-multi.app
 plutil -extract CFBundleExecutable raw "$APP/Contents/Info.plist"   # → claude-multi
-otool -L "$APP/Contents/MacOS/claude-multi" | grep WebKit           # the app links WebKit; the CLI doesn't
+otool -L "$APP/Contents/MacOS/claude-multi" | grep WebKit           # the app links WebKit
 ```
 
 The release workflow runs this same check on its macOS jobs, and `docs/SMOKE-CHECKLIST.md` covers what to verify on a draft release before publishing it.
+
+**Bundling the `cms` sidecar.** Tracking hooks call the `cms` binary, so release bundles ship it next to the app. Use `npm run build:app` (equivalent to `tauri build --config src-tauri/tauri.bundle.conf.json`) instead of plain `npm run tauri build` when you want that: the overlay config builds `cms` via `scripts/build-sidecar.mjs` and registers it as an `externalBin`. It is an overlay (not in `tauri.conf.json`) because `externalBin` would otherwise break `cargo test`/`clippy`. Plain `tauri build` still works but omits the sidecar; then install the CLI with `npm run install-cli` (hooks also look in `~/.local/bin/cms`). On macOS the bundle's `Contents/MacOS` then holds both `claude-multi` and `cms`; `cms` also links WebKit, so the `otool` check only proves the path you point it at: keep checking `CFBundleExecutable` and the file name.
 
 **Unsigned builds**: bundles are ad-hoc signed (no Developer ID / notarization), so other machines' Gatekeeper/SmartScreen will warn. On macOS the recipient can right-click → **Open** once, or run `xattr -dr com.apple.quarantine /Applications/claude-multi.app`. Frictionless distribution needs platform code-signing (e.g. Apple Developer ID + notarization via `bundle.macOS.signingIdentity` and the `APPLE_*` env vars) — not set up here.
 

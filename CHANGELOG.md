@@ -6,6 +6,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Session tracking (opt-in, off by default)**: Preferences -> Tracking points
+  sessions at your own Cloudflare backend (`cloud/`: `cm-ingest` + `cm-dashboard`
+  Workers on one D1 database, dashboard behind Cloudflare Access) and optionally
+  at Grafana Cloud for metrics. Records metadata only (counts, tokens, cost,
+  host, IP/geo, cwd, branch); Claude Code telemetry env is injected into tray and
+  `cms` launches.
+- **`cms --hook start|end`**: SessionStart/SessionEnd hooks, installed into each
+  account's `settings.json` when tracking is on and removed when it is turned
+  off (user hooks are preserved). Events are spooled on disk when offline.
+- **Optional AI session summary**: a detached Haiku call on the same account
+  summarizes the session when it ends (uses the transcript and quota).
+- **Test connection** and masked tokens in Preferences; warns for Claude Code
+  older than 2.1.212.
+- **`cms` ships as a bundled sidecar** (`npm run build:app`).
+
 ### Fixed
 
 - **Corrupt `config.json` is never overwritten**: a config that fails to parse

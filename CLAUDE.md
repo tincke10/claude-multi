@@ -34,7 +34,11 @@ Single-responsibility modules in `src-tauri/src/`:
 | `cli.rs` | Pure decision logic for the `cms` CLI: `parse_cli_args` → `CliCommand`, fuzzy `match_account` (`AccountMatchError`: none/ambiguous), `launch_plan` |
 | `usage.rs` | Per-account token usage from `<config_dir>/projects/**/*.jsonl` over rolling windows (5h session / 7d week): pure aggregation (`TokenTotals`, `UsageSummary`, window starts, formatting) + thin file-walking edge `account_usage`. Never reads the default `~/.claude` |
 | `bin/cms.rs` | `cms` binary: edge I/O only (config via `Config::try_load` + `standalone_config_file_path`, session gate, inherit, exec `claude` inline); logic lives in `cli.rs` |
-| `tracking.rs` / `tracking_check.rs` | Tracking env + validation + token masking (`mask_tracking`/`unmask_tracking`, `TOKEN_MASK`: the UI never receives real tokens; the sentinel on save keeps the stored secret). `tracking_check`: pure probe builders/status mappers + `probe` edge (ureq, no redirects) behind the `test_tracking_connection` command |
+| `tracking.rs` / `tracking_check.rs` | Tracking env + validation + token masking (`mask_tracking`/`unmask_tracking`, `TOKEN_MASK`: the UI never receives real tokens; the sentinel on save keeps the stored secret). `tracking_env` is pure (`OTEL_*` for logs → cm-ingest, metrics → Grafana, `cm.account`/`cm.origin`); disabled → empty. `tracking_check`: pure probe builders/status mappers + `probe` edge (ureq, no redirects) behind the `test_tracking_connection` command (also warns when `claude` < `MIN_CLAUDE_VERSION` 2.1.212) |
+| `hook.rs` | `cms --hook start\|end` (Claude Code SessionStart/SessionEnd): pure `parse_hook_input` (`reason`, alias `why`), `parse_git_head`, payload builders, `classify` (2xx/4xx delete, 408/429/5xx/transport keep), spool (`<app config dir>/spool`, 0600, cap `SPOOL_CAP`=500 drop-oldest, `FLUSH_LIMIT`=20) + `ureq` POST to `<ingest>/api/events`, `hook.log`. Always exits 0, prints nothing to stdout, early-exits on `CMS_HOOK_INNER=1` / tracking disabled / unresolved account (via `config::find_account_by_dir`). `end` spawns the detached summary worker |
+| `summary.rs` | `cms --summarize <job>` worker: pure `summary_argv` (`-p --resume <transcript> --model haiku --settings {"disableAllHooks":true} --no-session-persistence --max-turns 1 --output-format text <prompt>`), `summary_env` (`CMS_HOOK_INNER=1`, telemetry off, `OTEL_*` stripped), `map_run_result` (ok/error, truncated), job files, 300 s timeout; `claude` resolved by name through the hook's inherited PATH (the one place the GUI-PATH invariant does not apply) |
+| `hooks_install.rs` | Pure `merge_tracking_hooks` (add/update/remove owned `SessionStart`/`SessionEnd` entries, `HookPolicy::{Replace,KeepExisting}`, preserves foreign hooks and key order) + `is_owned` + edge `ensure_hooks`/`sync_*` (atomic write; refuses symlinked `settings.json`, the default `~/.claude`, non-object or malformed JSON). Must run AFTER `inherit::seed_and_apply` |
+| `cms_path.rs` | Locates the `cms` binary hooks must call: `candidates` (pure: next to the running exe, then `~/.local/bin`) + `resolve`. None → hooks not installed, UI warning |
 | `commands.rs` | `#[tauri::command]`s: `get_config` (returns `Result`: a corrupt config surfaces as an error in Preferences)/`save_config`/`list_terminals`, `get_inherit_status`/`set_inherit_decision`, `launch_session`/`open_session`/`login_account`/`logout_account`/`relogin_account`, manual-command clipboard fallbacks. All config access goes through the managed `ConfigStore` |
 | `tray.rs` | `build_menu` (from config) + `build_tray` (icon + events) + `refresh_tray` (live rebuild via `tray_by_id` + `set_menu`); `parse_menu_id`/`MenuAction` |
 | `lib.rs` | Builder wiring: plugins (single-instance first — a second launch focuses Preferences and exits; dialog, clipboard), manages the `ConfigStore`, `invoke_handler`, tray setup, window close-to-hide |
@@ -57,6 +61,11 @@ Frontend (`src/`): `api.ts` (typed `invoke` wrappers + types), `App.tsx` (Prefer
 - **Temp scripts**: atomic create, restrictive perms, unguessable name (use the `tempfile` path in `write_script`).
 - **GUI PATH**: the app process lacks the user's shell `PATH` (no `~/.local/bin`), so `claude` is invoked **through the terminal adapter**, never via a bare `Command::new("claude")`.
 
+- **Tracking hooks are identified only by** `type == "command"`, `args[0] == "--hook"` and a command file name of `cms`/`cms.exe` (no custom JSON keys: Claude Code's settings schema must keep accepting the file). Never touch entries that don't match.
+- **Never write `settings.json` through a symlink or into the default `~/.claude`** (`hooks_install::ensure_hooks` refuses both).
+- **Tracking secrets** (`ingest_token`, `grafana_token`) are masked on the way to the UI (`TOKEN_MASK`), resolved against the stored value on save, and **never** appear in `manual_*` clipboard builders. They do land in the 0700 temp launch scripts and the session env (documented in the README).
+- **`cms --hook` always exits 0**, writes nothing to stdout and never blocks Claude Code; failures go to `hook.log`/the spool.
+
 ## Conventions
 
 - Code, identifiers, docs, commit messages, PRs: **English**.
@@ -64,6 +73,19 @@ Frontend (`src/`): `api.ts` (typed `invoke` wrappers + types), `App.tsx` (Prefer
 - A repo hook blocks `git commit` without validation tooling; commit with `git commit --no-verify`.
 - Tauri **v2** APIs only (`TrayIconBuilder`, `MenuBuilder`, `app.path()`), never v1.
 - Config dirs use the fixed `~/.claude-` prefix + a free suffix (enforced in the Preferences UI).
+
+## Cloud backend (`cloud/`)
+
+Separate npm workspace (own `package.json` + lockfile; the root `npm ci` is untouched): `packages/core` (shared types/SQL; `TOKEN_ATTR` holds the OTLP token attribute names, unconfirmed against a real payload), `ingest` (`cm-ingest` Worker, writes D1), `dashboard` (`cm-dashboard` Worker + React SPA, read-only, Cloudflare Access JWT), `migrations/` (applied only from `ingest`). Setup and manual checks: `cloud/README.md`.
+
+```sh
+cd cloud
+npm ci
+npm test            # vitest for all workspaces
+npm run typecheck   # wrangler types + tsc
+```
+
+Deploying, creating the D1 database, secrets and Access are USER steps; never run them from tooling.
 
 ## Spec & history
 

@@ -289,11 +289,44 @@ never publish a draft whose bundle nobody opened.
 - [ ] macOS: mount the `aarch64.dmg` and confirm
       `Contents/MacOS/claude-multi` exists and is ~10 MB (`plutil -extract
       CFBundleExecutable raw .../Info.plist` prints `claude-multi`, and
-      `otool -L` on it lists `WebKit.framework` — the CLI links neither).
+      `otool -L` on it lists `WebKit.framework`; the bundled `cms` sidecar links it too, so rely on `CFBundleExecutable`, not on WebKit, to tell them apart).
 - [ ] Install that build and launch it: the tray icon appears and its menu
       lists the configured accounts.
 - [ ] `defaults read /Applications/claude-multi.app/Contents/Info.plist
       CFBundleShortVersionString` matches the tag.
+
+---
+
+## Session tracking (requires the cloud setup in `cloud/README.md`)
+
+Use a throwaway account and Claude Code >= 2.1.212.
+
+- [ ] Preferences -> Tracking: fill ingest URL + token (and optionally the
+      Grafana fields) -> **Test connection**. Expect "Connected: ingest
+      reachable, token accepted." A wrong token shows the 401 message; a wrong
+      URL the 404 message; an old `claude` shows a version warning.
+- [ ] Save, reopen Preferences: both token fields show the mask, not the real
+      value. Save again without touching them: Test connection still passes
+      (the stored token was kept).
+- [ ] Tick **Enabled**, Save. The account's `<config_dir>/settings.json` now has
+      `SessionStart` and `SessionEnd` entries running `cms --hook start|end`;
+      any hooks you already had are still there.
+- [ ] Launch a session from the tray (and one with `cms <account>`). Shortly after
+      a row appears in the dashboard with the account, host, cwd/project, git
+      branch, public IP and **geo** (country/city). Origin shows `tray` / `cms`.
+- [ ] Send a prompt: counts, tokens and cost increase on the row.
+- [ ] End the session (`/exit`). The row becomes *ended* with the end reason.
+- [ ] With **AI summary** on: a summary appears on the session detail a short
+      while after the end, even if you closed the terminal right away.
+- [ ] Take the network offline, run and end a session, go back online and start
+      another: the earlier events show up (spooled, then flushed).
+- [ ] Untick **Enabled**, Save: the `cms --hook` entries are gone from every
+      account's `settings.json` (your own hooks untouched); a new session sends
+      nothing.
+- [ ] The dashboard URL (and a preview/version URL) is not reachable without
+      passing Cloudflare Access.
+- [ ] Bundled app only: `Contents/MacOS/cms` exists next to `claude-multi`,
+      and the app still starts as a tray app.
 
 ---
 
