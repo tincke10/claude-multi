@@ -403,6 +403,7 @@ mod tests {
             }],
             projects,
             tracking: Default::default(),
+            usage: Default::default(),
         }
     }
 

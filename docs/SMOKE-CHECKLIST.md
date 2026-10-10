@@ -361,6 +361,43 @@ Use a throwaway account and Claude Code >= 2.1.212.
 
 ---
 
+## UX overhaul (tabs, rooms, real usage)
+
+Use a throwaway account that is logged in. Statusline checks need Claude Code
+and a terminal (tmux works well for driving the TUI).
+
+- [ ] Preferences opens on the **Accounts** tab; tabs are Accounts, Projects,
+      Tracking, Settings (and Orca only when Orca is installed). Reopen: the
+      last tab used is selected.
+- [ ] Edit an account label, switch tabs and back: the edit is still there. One
+      **Save** persists everything. A duplicated config dir puts a marker on its
+      tab, disables Save and the footer names that tab.
+- [ ] Fonts offline: turn the network off, reopen Preferences. Text renders in
+      Figtree and headings in Bricolage Grotesque, and devtools shows no
+      external font requests.
+- [ ] Rooms: a logged-in account shows its email, vessels and actions; a
+      logged-out account shows the empty room with a primary **Log in**; an
+      expired one offers **Log in again**. No Session/Week ceiling inputs exist.
+- [ ] Statusline install: with **Use the statusline to read real usage** on, the
+      account's `<config_dir>/settings.json` has a `statusLine` command
+      `'<path>/cms' --statusline`. If you had your own statusline, it is saved in
+      `<config_dir>/.claude-multi-statusline.json` (mode 0600).
+- [ ] Statusline chain: open `claude` under the account, send one prompt. Your own
+      statusline still renders as before, and `<app data>/usage/<hash8>.json`
+      appears with mode 0600.
+- [ ] The Accounts tab shows the same 5h/7d percentages as the statusline, the
+      plan chip (for example Max 20x) and pacing chips; "Updated ..." shows the
+      reading's age.
+- [ ] Statusline uninstall: turn the toggle off and Save. `settings.json`
+      `statusLine` equals your original value again (or is gone if you had none),
+      the sidecar is deleted, and the default `~/.claude` is untouched.
+- [ ] Account API (off by default): with the switch off, no network request is
+      made for usage. Turn it on: the warning text is visible in Settings, the
+      room gains a per-model vessel (for example Fable) and an "Account API"
+      source chip. Turn it off: the extra vessel disappears.
+
+---
+
 ## Known caveats
 
 - **Linux hover-refresh**: not available (no tray hover events); save-refresh works.

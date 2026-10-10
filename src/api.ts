@@ -41,11 +41,19 @@ export type TrackingCheck = {
   cms_path: string | null;
   warnings: string[];
 };
+// Where real usage numbers come from. Mirrors `config::UsageSourcesConfig`.
+export type UsageSourcesConfig = {
+  // Install `cms --statusline` per account to read rate limits from Claude Code's statusline.
+  statusline_enabled: boolean;
+  // Opt-in (later phase): Anthropic's undocumented OAuth usage endpoint.
+  endpoint_enabled: boolean;
+};
 export type Config = {
   terminal: string;
   accounts: Account[];
   projects: Project[];
   tracking: TrackingConfig;
+  usage: UsageSourcesConfig;
 };
 export type TerminalInfo = { id: string; label: string };
 
@@ -112,8 +120,30 @@ export const importOrcaRepos = (selections: ImportSelection[]) =>
 
 // Preferences Accounts card: login status + rolling usage per saved account.
 export type AccountStatus = "logged_in" | "logged_out" | "expired";
-// `percent` is clamped to 100 and null without a ceiling (show raw tokens).
-export type UsageView = { used: number; ceiling: number | null; percent: number | null };
+export type UsageSource = "endpoint" | "statusline" | "estimate" | "none";
+export type Pacing = { kind: "under" | "on" | "over"; points: number };
+// One rate-limit window. `percent` is as reported (unclamped); null = no data yet.
+export type UsageWindow = {
+  percent: number | null;
+  // Epoch seconds at which the window resets.
+  resets_at: number | null;
+  source: UsageSource;
+  age_secs: number | null;
+  stale: boolean;
+  // Local token estimate, only when `source` is "estimate".
+  est_tokens: number | null;
+  pacing: Pacing | null;
+};
+export type ModelWindow = { label: string; window: UsageWindow };
+export type AccountUsage = {
+  session: UsageWindow;
+  week: UsageWindow;
+  models: ModelWindow[];
+  tier: string | null;
+  org: string | null;
+  // Why the opt-in account API has nothing to show right now, if it is on.
+  endpoint_note: string | null;
+};
 export type AccountOverview = {
   id: string;
   label: string;
@@ -121,10 +151,11 @@ export type AccountOverview = {
   status: AccountStatus;
   email: string | null;
   dir_exists: boolean;
-  session: UsageView;
-  week: UsageView;
+  usage: AccountUsage;
 };
-export const accountsOverview = () => invoke<AccountOverview[]>("accounts_overview");
+// `refresh` forces the opt-in account API to re-query (still rate limited server-side).
+export const accountsOverview = (refresh = false) =>
+  invoke<AccountOverview[]>("accounts_overview", { refresh });
 // These open the configured terminal; the outcome shows up later in the overview.
 export const loginAccount = (accountId: string) => invoke<void>("login_account", { accountId });
 export const logoutAccount = (accountId: string) => invoke<void>("logout_account", { accountId });

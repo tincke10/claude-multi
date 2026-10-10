@@ -1,6 +1,6 @@
 import type {
   HealthLevel, ImportCandidate, ImportSelection, OrcaHealth, OrcaHealthCheck, Project,
-} from "./api";
+} from "../api";
 
 // The Orca card only exists when the backend supports it (macOS) AND Orca is
 // actually installed; otherwise the whole integration stays hidden.

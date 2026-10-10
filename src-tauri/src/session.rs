@@ -19,7 +19,6 @@
 
 use crate::config::Account;
 use crate::paths::expand_tilde;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -68,9 +67,10 @@ enum CredentialSource {
 /// pure and unit-tested on every OS.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn keychain_service(config_dir: &str) -> String {
-    let digest = Sha256::digest(config_dir.as_bytes());
-    let hash8: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    format!("Claude Code-credentials-{hash8}")
+    format!(
+        "Claude Code-credentials-{}",
+        crate::paths::config_dir_hash8(config_dir)
+    )
 }
 
 /// Pure expiry evaluation over the credentials JSON (`claudeAiOauth` payload).
@@ -133,30 +133,126 @@ pub fn security_item_not_found(exit_code: Option<i32>, stderr: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn read_keychain_credentials(config_dir: &Path) -> CredentialSource {
     let service = keychain_service(&config_dir.to_string_lossy());
-    let Ok(output) = std::process::Command::new("security")
-        .args(["find-generic-password", "-w", "-s", &service])
-        .output()
-    else {
-        return CredentialSource::Unreadable;
-    };
-    if output.status.success() {
-        return match String::from_utf8(output.stdout) {
-            Ok(json) => CredentialSource::Found(json),
-            Err(_) => CredentialSource::Unreadable,
-        };
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if security_item_not_found(output.status.code(), &stderr) {
-        CredentialSource::Absent
-    } else {
-        CredentialSource::Unreadable
-    }
+    let mut cmd = std::process::Command::new("security");
+    cmd.args(["find-generic-password", "-w", "-s", &service]);
+    keychain_read(cmd, KEYCHAIN_TIMEOUT)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn read_keychain_credentials(_config_dir: &Path) -> CredentialSource {
     // No Keychain elsewhere: a missing `.credentials.json` is the whole story.
     CredentialSource::Absent
+}
+
+/// How long a Keychain read may take before it counts as unreadable (a prompt
+/// nobody answers must not freeze the overview).
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(3);
+const KEYCHAIN_OUT_CAP: usize = 64 * 1024;
+
+/// Runs a `security`-style command with a hard timeout and maps the outcome:
+/// output on success -> `Found`, "item not found" -> `Absent`, anything else
+/// (including a timeout) -> `Unreadable`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn keychain_read(cmd: std::process::Command, timeout: Duration) -> CredentialSource {
+    let Ok(output) = crate::proc_timeout::run_with_timeout(cmd, None, timeout, KEYCHAIN_OUT_CAP)
+    else {
+        return CredentialSource::Unreadable;
+    };
+    let Some(status) = output.status.filter(|_| !output.timed_out) else {
+        return CredentialSource::Unreadable; // hung (e.g. unanswered prompt)
+    };
+    if status.success() {
+        return match String::from_utf8(output.stdout) {
+            Ok(json) => CredentialSource::Found(json),
+            Err(_) => CredentialSource::Unreadable,
+        };
+    }
+    // stderr is discarded by the runner; exit status 44 is the not-found signal.
+    if security_item_not_found(status.code(), "") {
+        CredentialSource::Absent
+    } else {
+        CredentialSource::Unreadable
+    }
+}
+
+/// Maps a raw credential read to an expiry verdict at `now_ms`.
+fn verdict_from_source(source: CredentialSource, now_ms: i64) -> CredentialVerdict {
+    match source {
+        CredentialSource::Found(json) => evaluate_credentials(&json, now_ms),
+        CredentialSource::Unreadable => CredentialVerdict::Unknown,
+        CredentialSource::Absent => CredentialVerdict::Absent,
+    }
+}
+
+/// An OAuth access token, read-only and never persisted. `Debug` is redacted
+/// and there is deliberately no `Serialize`/`Display`.
+pub struct AccessToken(String);
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccessToken(<redacted>)")
+    }
+}
+
+impl AccessToken {
+    #[cfg(test)]
+    pub(crate) fn new(token: String) -> Self {
+        AccessToken(token)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenError {
+    Absent,
+    Unreadable,
+    Expired,
+    Malformed,
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TokenError::Absent => "no credentials found",
+            TokenError::Unreadable => "credentials could not be read",
+            TokenError::Expired => "access token has expired",
+            TokenError::Malformed => "credentials are malformed",
+        })
+    }
+}
+
+/// Pure: pulls the access token out of the credentials JSON, refusing one
+/// whose `expiresAt` (epoch ms) is already past. Never refreshes anything.
+pub fn extract_access_token(json: &str, now_ms: i64) -> Result<AccessToken, TokenError> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|_| TokenError::Malformed)?;
+    let oauth = value.get("claudeAiOauth").ok_or(TokenError::Malformed)?;
+    let token = oauth
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or(TokenError::Malformed)?;
+    if oauth
+        .get("expiresAt")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|exp| exp <= now_ms)
+    {
+        return Err(TokenError::Expired); // never refreshed from here
+    }
+    Ok(AccessToken(token.to_string()))
+}
+
+/// Read-only access-token lookup for one config dir (file or Keychain).
+pub fn read_access_token(config_dir: &Path) -> Result<AccessToken, TokenError> {
+    match read_credentials(config_dir) {
+        CredentialSource::Found(json) => {
+            extract_access_token(&json, chrono::Utc::now().timestamp_millis())
+        }
+        CredentialSource::Absent => Err(TokenError::Absent),
+        CredentialSource::Unreadable => Err(TokenError::Unreadable),
+    }
 }
 
 /// How long a credential verdict is reused before re-reading its source.
@@ -219,13 +315,10 @@ fn cached_verdict(config_dir: &Path) -> CredentialVerdict {
             }
         }
     }
-    let verdict = match read_credentials(config_dir) {
-        CredentialSource::Found(json) => {
-            evaluate_credentials(&json, chrono::Utc::now().timestamp_millis())
-        }
-        CredentialSource::Unreadable => CredentialVerdict::Unknown,
-        CredentialSource::Absent => CredentialVerdict::Absent,
-    };
+    let verdict = verdict_from_source(
+        read_credentials(config_dir),
+        chrono::Utc::now().timestamp_millis(),
+    );
     if !in_grace && verdict != CredentialVerdict::Absent {
         if let Ok(mut cache) = verdict_cache().lock() {
             cache.insert(config_dir.to_path_buf(), (Instant::now(), verdict));
@@ -580,6 +673,121 @@ mod tests {
                 SessionStatus::Expired { .. }
             ),
             "verdict must come from the cache within the TTL"
+        );
+    }
+
+    // ---- keychain timeout + access token (Phase 5) ----------------------
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> std::process::Command {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_be_unreadable_when_keychain_command_hangs() {
+        let t = Instant::now();
+        let got = keychain_read(sh("sleep 30"), Duration::from_millis(300));
+        assert_eq!(got, CredentialSource::Unreadable);
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_map_keychain_command_outcomes() {
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            keychain_read(sh("printf '{\"a\":1}'"), t),
+            CredentialSource::Found("{\"a\":1}".into())
+        );
+        assert_eq!(keychain_read(sh("exit 44"), t), CredentialSource::Absent);
+        assert_eq!(keychain_read(sh("exit 1"), t), CredentialSource::Unreadable);
+    }
+
+    #[test]
+    fn test_should_keep_logged_in_verdict_when_credentials_unreadable() {
+        let v = verdict_from_source(CredentialSource::Unreadable, NOW);
+        assert_eq!(v, CredentialVerdict::Unknown);
+        assert_eq!(
+            status_from("a@b.c".into(), v),
+            SessionStatus::LoggedIn {
+                email: "a@b.c".into()
+            }
+        );
+        assert_eq!(
+            verdict_from_source(CredentialSource::Absent, NOW),
+            CredentialVerdict::Absent
+        );
+    }
+
+    #[test]
+    fn test_should_extract_access_token_when_not_expired() {
+        let json = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"sk-secret-1","expiresAt":{}}}}}"#,
+            NOW + 1000
+        );
+        let t = extract_access_token(&json, NOW).unwrap();
+        assert_eq!(t.expose(), "sk-secret-1");
+    }
+
+    #[test]
+    fn test_should_refuse_expired_or_malformed_access_token() {
+        let expired = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"sk-secret-1","expiresAt":{}}}}}"#,
+            NOW - 1
+        );
+        assert_eq!(
+            extract_access_token(&expired, NOW).unwrap_err(),
+            TokenError::Expired
+        );
+        for bad in [
+            "not json",
+            "{}",
+            r#"{"claudeAiOauth":{}}"#,
+            r#"{"claudeAiOauth":{"accessToken":""}}"#,
+        ] {
+            assert_eq!(
+                extract_access_token(bad, NOW).unwrap_err(),
+                TokenError::Malformed,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_never_reveal_access_token_in_debug_or_error_text() {
+        let json = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"sk-secret-1","expiresAt":{}}}}}"#,
+            NOW + 1000
+        );
+        let t = extract_access_token(&json, NOW).unwrap();
+        assert!(!format!("{t:?}").contains("sk-secret-1"));
+        for e in [
+            TokenError::Absent,
+            TokenError::Unreadable,
+            TokenError::Expired,
+            TokenError::Malformed,
+        ] {
+            assert!(!format!("{e} {e:?}").contains("sk-secret"));
+        }
+    }
+
+    #[test]
+    fn test_should_read_access_token_from_credentials_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let far = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            format!(r#"{{"claudeAiOauth":{{"accessToken":"sk-file","expiresAt":{far}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_access_token(dir.path()).unwrap().expose(), "sk-file");
+        std::fs::write(dir.path().join(".credentials.json"), "garbage").unwrap();
+        assert_eq!(
+            read_access_token(dir.path()).unwrap_err(),
+            TokenError::Malformed
         );
     }
 }

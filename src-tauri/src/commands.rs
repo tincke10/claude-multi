@@ -4,6 +4,7 @@ use crate::config::{
 use crate::hooks_install::{self, HookPolicy};
 use crate::overview::{self, AccountOverview};
 use crate::paths::expand_tilde;
+use crate::statusline_install;
 use crate::{adapters, inherit, launcher, session, tracking, tracking_check, usage};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -47,6 +48,8 @@ fn prompt_inherit_decision(app: &AppHandle, account_id: &str, subdir: &str) -> I
 fn ensure_account_inherits(app: &AppHandle, account_id: &str) -> Result<(), String> {
     inherit_account(app, account_id)?;
     sync_account_hooks(app, account_id);
+    // After the seed: the user's seeded statusLine is what gets preserved.
+    sync_account_statusline(app, account_id);
     Ok(())
 }
 
@@ -60,6 +63,21 @@ fn sync_account_hooks(app: &AppHandle, account_id: &str) {
     let dir = expand_tilde(&account.config_dir);
     if let Err(e) = hooks_install::sync_account(&dir, cfg.tracking.enabled, HookPolicy::Replace) {
         eprintln!("tracking hooks sync failed for account '{account_id}': {e}");
+    }
+}
+
+/// Best-effort install/remove of the usage statusline for one account (the
+/// tray owns the canonical cms path, so an existing entry is rewritten).
+fn sync_account_statusline(app: &AppHandle, account_id: &str) {
+    let Ok(cfg) = load_config(app) else { return };
+    let Some(account) = cfg.account(account_id) else {
+        return;
+    };
+    let dir = expand_tilde(&account.config_dir);
+    if let Err(e) =
+        statusline_install::sync_account(&dir, cfg.usage.statusline_enabled, HookPolicy::Replace)
+    {
+        eprintln!("usage statusline sync failed for account '{account_id}': {e}");
     }
 }
 
@@ -155,26 +173,42 @@ pub fn save_config(app: AppHandle, config: Config) -> Result<Vec<String>, String
     // tray-prompt decision may have landed since the UI loaded its copy). Masked
     // tracking tokens resolve to the stored ones and tracking is validated on
     // the resolved values; an Err here aborts before anything is written.
-    let (was_enabled, now_enabled, dirs) = app.state::<ConfigStore>().update(|disk| {
-        let was_enabled = disk.tracking.enabled;
-        *disk = merge_saved_config(config, disk)?;
-        let dirs: Vec<_> = disk
-            .accounts
-            .iter()
-            .map(|a| expand_tilde(&a.config_dir))
-            .collect();
-        Ok((was_enabled, disk.tracking.enabled, dirs))
-    })?;
+    let (was_enabled, now_enabled, statusline_was, statusline_now, dirs) =
+        app.state::<ConfigStore>().update(|disk| {
+            let was_enabled = disk.tracking.enabled;
+            let statusline_was = disk.usage.statusline_enabled;
+            *disk = merge_saved_config(config, disk)?;
+            let dirs: Vec<_> = disk
+                .accounts
+                .iter()
+                .map(|a| expand_tilde(&a.config_dir))
+                .collect();
+            Ok((
+                was_enabled,
+                disk.tracking.enabled,
+                statusline_was,
+                disk.usage.statusline_enabled,
+                dirs,
+            ))
+        })?;
     // Rebuild (after the lock is released) the tray menu so changes apply immediately, no restart needed.
     let _ = crate::tray::refresh_tray(&app);
 
     // Tracking toggled: install/remove hooks for every account. File I/O runs
     // outside the store lock; failures are reported, never fatal to Save.
-    let warnings = if was_enabled != now_enabled {
+    let mut warnings = if was_enabled != now_enabled {
         hooks_install::sync_all(&dirs, now_enabled, HookPolicy::Replace)
     } else {
         Vec::new()
     };
+    // Same for the usage statusline toggle (off = uninstall + restore).
+    if statusline_was != statusline_now {
+        warnings.extend(statusline_install::sync_all(
+            &dirs,
+            statusline_now,
+            HookPolicy::Replace,
+        ));
+    }
     Ok(warnings)
 }
 
@@ -485,26 +519,126 @@ pub fn relogin_account(app: AppHandle, account_id: String) -> Result<(), String>
 /// config dir and never opens a terminal. Keychain reads and log scans run on a
 /// blocking thread so the UI thread never stalls.
 #[tauri::command]
-pub async fn accounts_overview(app: AppHandle) -> Result<Vec<AccountOverview>, String> {
+pub async fn accounts_overview(
+    app: AppHandle,
+    refresh: Option<bool>,
+) -> Result<Vec<AccountOverview>, String> {
     // Lock-free config read; the probes below can take a while.
     let cfg = load_config(&app)?;
+    let force = refresh.unwrap_or(false);
+    let endpoint_on = cfg.usage.endpoint_enabled;
+    let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
         let now = chrono::Utc::now();
         let session_since = usage::session_window_start(now);
         let week_since = usage::week_window_start(now);
-        cfg.accounts
+        let app_data = crate::paths::app_data_dir();
+
+        // Phase 1: local, per-account data (sequential, no network).
+        struct Local {
+            dir: std::path::PathBuf,
+            status: session::SessionStatus,
+            probed: bool,
+            windows: Vec<usage::UsageSummary>,
+            record: Option<crate::statusline::UsageRecord>,
+            oauth: Option<crate::config::OauthAccount>,
+        }
+        let locals: Vec<Local> = cfg
+            .accounts
             .iter()
             .map(|account| {
-                let dir_exists = expand_tilde(&account.config_dir).is_dir();
-                if !dir_exists {
+                let dir = expand_tilde(&account.config_dir);
+                if !dir.is_dir() {
                     // Nothing to probe: skip the Keychain and the log scan.
-                    let none = session::SessionStatus::LoggedOut { last_email: None };
-                    let empty = usage::UsageSummary::default();
-                    return overview::build_overview(account, &none, false, &empty, &empty);
+                    return Local {
+                        dir,
+                        status: session::SessionStatus::LoggedOut { last_email: None },
+                        probed: false,
+                        windows: vec![usage::UsageSummary::default(); 2],
+                        record: None,
+                        oauth: None,
+                    };
                 }
                 let status = session::account_session_status(account);
                 let windows = usage::account_usage(account, &[session_since, week_since]);
-                overview::build_overview(account, &status, true, &windows[0], &windows[1])
+                // The recorder hashes the EXPANDED dir it was launched with.
+                let record = app_data
+                    .as_deref()
+                    .and_then(|d| crate::statusline::read_usage_record(d, &dir.to_string_lossy()));
+                let oauth = crate::config::read_oauth_account(&dir);
+                Local {
+                    dir,
+                    status,
+                    probed: true,
+                    windows,
+                    record,
+                    oauth,
+                }
+            })
+            .collect();
+
+        // Phase 2: opt-in endpoint, concurrent across accounts with an overall
+        // deadline (shares Claude Code's rate limits; only for a usable login;
+        // the cache enforces TTL/backoff). Accounts that miss the deadline fall
+        // back to statusline/estimate for this call.
+        let jobs: Vec<Option<(std::path::PathBuf, bool)>> = locals
+            .iter()
+            .map(|l| {
+                (endpoint_on
+                    && l.probed
+                    && matches!(l.status, session::SessionStatus::LoggedIn { .. }))
+                .then(|| {
+                    let has_tier = l.oauth.as_ref().is_some_and(|o| {
+                        o.rate_tier
+                            .as_deref()
+                            .and_then(overview::tier_label)
+                            .or_else(|| o.org_type.as_deref().and_then(overview::tier_label))
+                            .is_some()
+                    });
+                    (l.dir.clone(), !has_tier)
+                })
+            })
+            .collect();
+        let transport = std::sync::Arc::new(crate::usage_endpoint::UreqTransport::default());
+        let now_ts = now.timestamp();
+        let work_handle = handle.clone();
+        let readings = crate::usage_endpoint::run_concurrent(
+            jobs,
+            crate::usage_endpoint::FETCH_DEADLINE,
+            std::sync::Arc::new(move |job: Option<(std::path::PathBuf, bool)>| {
+                let (dir, need_profile) = job?;
+                let cache = work_handle.state::<crate::usage_endpoint::EndpointCache>();
+                crate::usage_endpoint::fetch_account(
+                    &cache,
+                    &crate::usage_endpoint::FetchRequest {
+                        enabled: true,
+                        dir: &dir,
+                        now: now_ts,
+                        force,
+                        need_profile,
+                    },
+                    &session::read_access_token,
+                    transport.as_ref(),
+                )
+            }),
+        );
+
+        cfg.accounts
+            .iter()
+            .zip(locals.iter())
+            .zip(readings)
+            .map(|((account, l), endpoint)| {
+                let endpoint = endpoint.flatten();
+                let inputs = overview::UsageInputs {
+                    record: l.record.as_ref(),
+                    session_estimate: &l.windows[0],
+                    week_estimate: &l.windows[1],
+                    oauth: l.oauth.as_ref(),
+                    endpoint: endpoint.as_ref(),
+                    now: now_ts,
+                };
+                overview::build_overview(account, &l.status, l.probed, &inputs)
             })
             .collect()
     })

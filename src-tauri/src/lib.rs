@@ -10,12 +10,17 @@ pub mod launcher;
 pub mod orca;
 pub mod overview;
 pub mod paths;
+pub mod proc_timeout;
 pub mod session;
+pub mod settings_file;
+pub mod statusline;
+pub mod statusline_install;
 pub mod summary;
 pub mod tracking;
 pub mod tracking_check;
 pub mod tray;
 pub mod usage;
+pub mod usage_endpoint;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -52,6 +57,7 @@ pub fn run() {
             app.manage(config::ConfigStore::new(paths::config_file_path(
                 app.handle(),
             )));
+            app.manage(usage_endpoint::EndpointCache::default());
             tray::build_tray(app)?;
             if let Some(win) = app.get_webview_window("main") {
                 let win_for_event = win.clone();

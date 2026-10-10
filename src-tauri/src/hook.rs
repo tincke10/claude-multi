@@ -528,11 +528,9 @@ pub fn local_ip() -> Option<String> {
     Some(s.local_addr().ok()?.ip().to_string()).filter(|ip| ip != "0.0.0.0")
 }
 
-/// Machine-local state dir (spool, jobs, hook.log): the single source of
-/// truth. Local, not Roaming, so queued events and logs never sync across
-/// Windows machines.
+/// Machine-local state dir; see `paths::app_data_dir`.
 fn app_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join(crate::paths::APP_IDENTIFIER))
+    crate::paths::app_data_dir()
 }
 
 pub fn spool_dir() -> Option<PathBuf> {

@@ -1,4 +1,4 @@
-import type { AccountOverview, AccountStatus, UsageView } from "./api";
+import type { AccountOverview, AccountStatus } from "../api";
 
 // Compact token count, same rules as the backend's `usage::human_tokens` (the
 // tray): `512`, `340k`, `1.2M`, `5M`.
@@ -9,14 +9,6 @@ export function humanTokens(n: number): string {
     return k >= 1_000 ? "1M" : `${k}k`;
   }
   return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
-}
-
-// `used / ceiling · %` with a ceiling, raw `used tok` without one (as the tray).
-export function usageText(u: UsageView): string {
-  if (u.ceiling !== null && u.percent !== null) {
-    return `${humanTokens(u.used)} / ${humanTokens(u.ceiling)} · ${u.percent}%`;
-  }
-  return `${humanTokens(u.used)} tok`;
 }
 
 export type AuthAction = "login" | "logout" | "relogin";
@@ -31,16 +23,19 @@ export function actionsFor(status: AccountStatus): AuthAction[] {
 }
 
 export const ACTION_LABEL: Record<AuthAction, string> = {
-  login: "Login",
-  logout: "Logout",
-  relogin: "Relogin",
+  login: "Log in",
+  logout: "Log out",
+  relogin: "Log in again",
 };
 
-export function statusPill(o: AccountOverview): { text: string; tone: "ok" | "warn" | "off" } {
-  switch (o.status) {
-    case "logged_in": return { text: o.email ?? "Logged in", tone: "ok" };
-    case "expired": return { text: "Session expired", tone: "warn" };
-    case "logged_out": return { text: "Not logged in", tone: "off" };
+export type RoomVariant = "normal" | "expired" | "empty";
+
+// A logged-out account is an empty (dashed) room; an expired one keeps its data.
+export function roomVariant(status: AccountStatus): RoomVariant {
+  switch (status) {
+    case "logged_in": return "normal";
+    case "expired": return "expired";
+    case "logged_out": return "empty";
   }
 }
 
