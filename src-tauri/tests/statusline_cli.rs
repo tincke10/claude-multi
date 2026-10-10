@@ -100,12 +100,14 @@ fn test_should_keep_stderr_empty_and_exit_zero_when_the_handler_panics() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn cms");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(INPUT.as_bytes())
-        .unwrap();
+    // The injected panic can happen before cms reads stdin and the process may
+    // exit first; on Linux the write then fails with BrokenPipe. That is fine:
+    // what matters is the exit status and an empty stderr.
+    match child.stdin.take().unwrap().write_all(INPUT.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing stdin: {e}"),
+    }
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);

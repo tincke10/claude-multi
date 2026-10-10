@@ -148,6 +148,8 @@ mod tests {
         assert_eq!(args[3], "path:/Users/test/my repo");
     }
 
+    // Parses the command with a real /bin/sh, so it only runs on Unix.
+    #[cfg(unix)]
     #[test]
     fn test_should_keep_hostile_account_as_single_shell_word_when_command_is_parsed() {
         // Round-trip through a real POSIX shell: `printf %s` of each word.

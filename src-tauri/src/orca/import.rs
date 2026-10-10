@@ -54,7 +54,8 @@ pub fn import_repos(
     })
 }
 
-#[cfg(test)]
+// Orca integration is macOS-only; these tests assert POSIX paths.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::config::{Account, Config, ConfigStore, Project};

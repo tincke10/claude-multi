@@ -323,6 +323,11 @@ mod tests {
     const CMS: &str = "/opt/app/cms";
     const OURS: &str = "'/opt/app/cms' --statusline";
 
+    /// The command `install` really writes: PowerShell form on Windows, POSIX elsewhere.
+    fn native_ours() -> String {
+        statusline_command(ShellKind::native(), CMS)
+    }
+
     fn enable(settings: Value, sidecar: &SidecarState) -> Plan {
         plan_statusline(settings, sidecar, Some(OURS), HookPolicy::Replace).unwrap()
     }
@@ -566,7 +571,7 @@ mod tests {
         )
         .unwrap();
         assert!(install(&acct, &default).unwrap());
-        assert_eq!(read(&p)["statusLine"]["command"], OURS);
+        assert_eq!(read(&p)["statusLine"]["command"], native_ours());
         let sc = read(&sidecar_path(&acct));
         assert_eq!(sc["v"], 1);
         assert_eq!(sc["original"], original);
@@ -622,7 +627,7 @@ mod tests {
         install(&acct, &default).unwrap();
         assert_eq!(
             read(&acct.join("settings.json"))["statusLine"]["command"],
-            OURS
+            native_ours()
         );
         uninstall(&acct, &default).unwrap();
         assert_eq!(read(&acct.join("settings.json")), json!({}));
