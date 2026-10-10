@@ -4,6 +4,119 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Tabbed Preferences**: Accounts, Projects (with Inheritance), Tracking, Orca
+  (only when Orca is installed) and Settings. Edits survive tab switches, one
+  **Save** applies everything, tabs with errors get a marker, and the last tab
+  is remembered.
+- **Sealed-rooms Accounts tab**: each account is a "room" with usage vessels
+  (Session 5h, Week 7d, plus one per model with the Account API), chips (plan
+  tier, pacing, source, freshness) and the login actions. Figtree and Bricolage
+  Grotesque are bundled, so the window renders offline
+  (`THIRD_PARTY_NOTICES.md`, SIL OFL 1.1).
+- **Real rate-limit usage from Claude Code's statusline** (on by default): each
+  account's `settings.json` runs `cms --statusline`, which records the 5h/7d
+  percentages to `<app data>/usage/<hash8>.json` (0600) and chains your own
+  statusline, which keeps rendering. Turning it off in Settings restores your
+  original `statusLine`. Data appears after the first reply of a session.
+- **Pacing and plan tier**: chips show whether you are on, over or under pace
+  for each window (within 5 points counts as on pace) and the plan (for example
+  Max 20x). Readings older than 30 minutes are marked stale.
+- **Opt-in Account API (off by default)**: Settings -> Account API reads
+  Anthropic's undocumented usage endpoint with your own OAuth token for exact
+  per-model limits (for example Fable) and the plan. A permanent warning covers
+  the risks (undocumented, terms grey area, shared rate limits, Keychain
+  prompt). The token is read-only and never stored or refreshed.
+- **Frontend tests**: Vitest (`npm test`) for the pure helpers.
+
+- **Accounts panel in Preferences**: each saved account shows its login status
+  (logged in with email, session expired, not logged in), Login / Logout /
+  Relogin buttons (via the configured terminal) and Session (5h) / Week (7d)
+  usage bars, with a refresh button. Useful when the tray menu is out of reach
+  (e.g. behind the display notch).
+- **Orca integration (macOS, read-only)**: Preferences gets an Orca panel with a
+  **health check** (cms on the login PATH and same version as the app, Orca's
+  agent command override, managed-account conflicts, unmapped repos), **Import
+  from Orca...** (pick repos, choose an account, worktree roots derived
+  automatically) and a tray **Open in Orca** submenu per project that opens an
+  Orca terminal running `cms <account>`. Orca is read through its CLI, with a
+  private snapshot copy of its SQLite profile as fallback; claude-multi never
+  writes Orca's files. Hidden when Orca is not installed. Adds a bundled SQLite
+  (`rusqlite`), about 1 MB on macOS builds only.
+- **`cms --version`** prints `cms <version>`.
+- **`cms --auto [claude args...]`**: picks the account from the working
+  directory (project path or the new per-project **Worktree roots** in
+  Preferences, longest match wins) and launches like `cms <account>`. Built for
+  Orca (Settings -> Agents -> Claude -> Command = `cms --auto`); see README
+  "Using with Orca".
+- **Session tracking (opt-in, off by default)**: Preferences -> Tracking points
+  sessions at your own Cloudflare backend (`cloud/`: `cm-ingest` + `cm-dashboard`
+  Workers on one D1 database, dashboard behind Cloudflare Access) and optionally
+  at Grafana Cloud for metrics. Records metadata only (counts, tokens, cost,
+  host, IP/geo, cwd, branch); Claude Code telemetry env is injected into tray and
+  `cms` launches.
+- **`cms --hook start|end`**: SessionStart/SessionEnd hooks, installed into each
+  account's `settings.json` when tracking is on and removed when it is turned
+  off (user hooks are preserved). Events are spooled on disk when offline.
+- **Optional AI session summary**: a detached Haiku call on the same account
+  summarizes the session when it ends (uses the transcript and quota).
+- **Test connection** and masked tokens in Preferences; warns for Claude Code
+  older than 2.1.212.
+- **`cms` ships as a bundled sidecar** (`npm run build:app`).
+
+### Fixed
+
+- **Corrupt `config.json` is never overwritten**: a config that fails to parse
+  is copied to a backup next to it, left untouched, and the error is shown in
+  Preferences instead of silently resetting to the default `personal` account.
+- **Atomic config save**: `config.json` is written to a temp file and renamed,
+  so a crash mid-save can no longer truncate it.
+- **Preferences Save no longer reverts inherit decisions**: Skip/Merge choices
+  made in the Inheritance panel survive a later Save.
+- **Manual fallback commands are escaped per shell**: the clipboard commands
+  shown when the terminal can't be opened now quote paths for POSIX shells and
+  for PowerShell (including the per-account env vars), instead of always
+  assuming POSIX.
+
+- **Corrupt-config backups are private**: `config.json.corrupt-<ts>` is now
+  created with `0600` on Unix (it was `0644` while `config.json` is `0600`).
+- **Skip now un-inherits**: switching a subdir from Merge to Skip removes the
+  symlinks previously created into `~/.claude/<sub>` (only links pointing
+  there; the account's own files and foreign symlinks are untouched). Merge
+  also drops links whose source entry was deleted. Windows copy-fallback
+  entries can't be identified as inherited and are left in place.
+- **OS junk is never inherited**: `.DS_Store`, `Thumbs.db` and `desktop.ini`
+  are excluded from linking, from the Inheritance status and from conflict
+  detection (a Finder-made `.DS_Store` no longer counts as account content).
+  Links created earlier are cleaned up on the next launch.
+- **Two accounts can no longer share a config dir**: Preferences marks the
+  duplicated suffixes (case- and trailing-slash-insensitive) and disables
+  Save, and `save_config` rejects such a config server-side with an error
+  naming both accounts.
+
+### Changed
+
+- Preferences is split into tabs instead of one long page; the Accounts panel
+  became the room grid. Usage now prefers real numbers (Account API, then
+  statusline) over the local token estimate, which is shown only as a fallback.
+- The `settings.json` read-modify-write shared by the tracking hooks and the
+  statusline lives in one guarded module (default `~/.claude` and symlinks are
+  refused, malformed files are never overwritten).
+- `config.json` gains a `usage` section (`statusline_enabled` default true,
+  `endpoint_enabled` default false); older configs load unchanged.
+- `config.json` is saved with `0600` permissions on Unix.
+- CI: clippy and the test suite now also run on macOS and Windows, and gate the
+  release builds.
+
+### Removed
+
+- The manual Session/Week token ceiling inputs in Preferences. The
+  `usage_limits` field stays in `config.json` and still drives the tray's
+  percentages.
+
 ## [0.6.0] — 2026-09-15
 
 ### Added

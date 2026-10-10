@@ -1,0 +1,21 @@
+{
+  "account": {
+    "uuid": "00000000-0000-0000-0000-000000000001",
+    "email": "user@example.com",
+    "full_name": "Example User",
+    "display_name": "Example",
+    "created_at": "2030-01-01T00:00:00Z",
+    "has_claude_max": true,
+    "has_claude_pro": false
+  },
+  "organization": {
+    "uuid": "00000000-0000-0000-0000-000000000002",
+    "name": "Example Org",
+    "organization_type": "claude_max",
+    "billing_type": "stripe_subscription",
+    "rate_limit_tier": "default_claude_max_20x",
+    "seat_tier": null,
+    "subscription_status": "active",
+    "has_extra_usage_enabled": false
+  }
+}

@@ -27,3 +27,9 @@ dist-ssr
 
 # Local Claude Code agent state
 .claude/
+
+# Tauri sidecar staged by scripts/build-sidecar.mjs
+src-tauri/binaries/
+
+# Python bytecode from docs/readme tests
+__pycache__/

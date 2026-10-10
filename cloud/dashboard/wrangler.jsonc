@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cm-dashboard",
+  "account_id": "4982f30e5231e1f679c1fc2e2c436f39",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  // Only the workers.dev hostname is served, and Access protects it. Preview
+  // URLs (<version>-cm-dashboard.<subdomain>.workers.dev) are extra hostnames
+  // Access might not cover, so they stay off.
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    // From the Worker's Access application (Workers & Pages → cm-dashboard →
+    // Access → Application values). Public identifiers, not secrets. Empty
+    // values make every request fail closed with 500.
+    "ACCESS_TEAM_DOMAIN": "https://tincke.cloudflareaccess.com",
+    "ACCESS_AUD": "110ed1754ba5b594a37c5876ecf7c2e93f19bfcbf9f54ef88ff25cd0f867d0a5",
+    "STALE_AFTER_HOURS": "6"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cm-db",
+      // Same database as cm-ingest.
+      // Migrations are owned by ../ingest; this Worker only SELECTs.
+      "database_id": "7ab4513a-edbb-476d-9464-62888d341c4b"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// How an account resolves a conflict between its own resources in a subdir and
 /// the shared resources inherited from `~/.claude`. Persisted per subdir name.
@@ -11,6 +12,38 @@ pub enum InheritDecision {
     Merge,
     /// Leave this subdir isolated; inherit nothing.
     Skip,
+}
+
+/// What `<config_dir>/.claude.json` records about the signed-in account. Only
+/// non-secret display fields are read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OauthAccount {
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    /// `organizationRateLimitTier`, else `userRateLimitTier`.
+    pub rate_tier: Option<String>,
+    pub org_type: Option<String>,
+}
+
+/// Reads the `oauthAccount` block of `<config_dir>/.claude.json`. `None` when
+/// the file is missing, malformed or has no such block.
+pub fn read_oauth_account(config_dir: &std::path::Path) -> Option<OauthAccount> {
+    let raw = std::fs::read_to_string(config_dir.join(".claude.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let oauth = value.get("oauthAccount")?;
+    let field = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    Some(OauthAccount {
+        email: field("emailAddress"),
+        org_name: field("organizationName"),
+        rate_tier: field("organizationRateLimitTier").or_else(|| field("userRateLimitTier")),
+        org_type: field("organizationType"),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -56,6 +89,12 @@ pub struct Project {
     /// legacy/unassigned projects, which then appear under no account.
     #[serde(default)]
     pub account: String,
+    /// Extra folders whose subtree also belongs to this project (e.g. Orca's
+    /// `~/orca/workspaces/<project>`, where worktrees are created). Used by
+    /// `cms --auto` to map a working directory to an account. `~` is expanded
+    /// at match time. `#[serde(default)]` keeps legacy configs loading.
+    #[serde(default)]
+    pub worktree_roots: Vec<String>,
 }
 
 /// Calibrated token ceilings for an account's tray usage lines. There is no
@@ -73,11 +112,70 @@ pub struct UsageLimits {
     pub weekly_tokens: Option<u64>,
 }
 
+/// Opt-in session tracking: where telemetry goes and with which credentials.
+/// Disabled by default; every field is optional on disk so configs written
+/// before this existed still load. The tokens are secrets (config.json is
+/// 0600): `Debug` redacts them so they never reach a log line.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct TrackingConfig {
+    pub enabled: bool,
+    /// Base URL of the `cm-ingest` Worker.
+    pub ingest_url: String,
+    pub ingest_token: String,
+    /// Grafana Cloud OTLP gateway, e.g. `https://otlp-gateway-<zone>.grafana.net/otlp`.
+    pub grafana_otlp_endpoint: String,
+    pub grafana_instance_id: String,
+    pub grafana_token: String,
+    /// Post an AI-written summary when a session ends.
+    pub summaries: bool,
+}
+
+impl std::fmt::Debug for TrackingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |s: &str| if s.is_empty() { "" } else { "<redacted>" }.to_string();
+        f.debug_struct("TrackingConfig")
+            .field("enabled", &self.enabled)
+            .field("ingest_url", &self.ingest_url)
+            .field("ingest_token", &redact(&self.ingest_token))
+            .field("grafana_otlp_endpoint", &self.grafana_otlp_endpoint)
+            .field("grafana_instance_id", &self.grafana_instance_id)
+            .field("grafana_token", &redact(&self.grafana_token))
+            .field("summaries", &self.summaries)
+            .finish()
+    }
+}
+
+/// Where real usage numbers come from. Every field is optional on disk, so
+/// configs written before this existed still load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UsageSourcesConfig {
+    /// Install `cms --statusline` in each account to record rate limits from
+    /// Claude Code's own statusline stream (on by default; reversible).
+    pub statusline_enabled: bool,
+    /// Opt-in: query Anthropic's (undocumented) OAuth usage endpoint.
+    pub endpoint_enabled: bool,
+}
+
+impl Default for UsageSourcesConfig {
+    fn default() -> Self {
+        Self {
+            statusline_enabled: true,
+            endpoint_enabled: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub terminal: String,
     pub accounts: Vec<Account>,
     pub projects: Vec<Project>,
+    #[serde(default)]
+    pub tracking: TrackingConfig,
+    #[serde(default)]
+    pub usage: UsageSourcesConfig,
 }
 
 impl Default for Config {
@@ -99,18 +197,44 @@ impl Default for Config {
                 usage_limits: UsageLimits::default(),
             }],
             projects: vec![],
+            tracking: TrackingConfig::default(),
+            usage: UsageSourcesConfig::default(),
         }
     }
 }
 
+/// Result of a side-effect-free read of `config.json`.
+#[derive(Debug)]
+pub enum LoadOutcome {
+    Loaded(Config),
+    /// No file on disk (first run).
+    Missing,
+    /// The file exists but is unreadable or not valid config JSON.
+    Corrupt(String),
+}
+
 impl Config {
-    /// Tray-side load: falls back to `Config::default()` on a missing or
-    /// unreadable file (deliberate for first-run). Callers that must not
-    /// invent the default `personal` account (the `cms` CLI) use `try_load`.
-    pub fn load(path: &Path) -> Config {
+    /// Reads `path` without touching the filesystem beyond the read itself.
+    pub fn read(path: &Path) -> LoadOutcome {
         match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| Config::default()),
-            Err(_) => Config::default(),
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(cfg) => LoadOutcome::Loaded(cfg),
+                Err(e) => LoadOutcome::Corrupt(format!("config.json is invalid: {e}")),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => LoadOutcome::Missing,
+            Err(e) => LoadOutcome::Corrupt(format!("config.json is unreadable: {e}")),
+        }
+    }
+
+    /// Tray-side load: falls back to `Config::default()` on a missing or
+    /// corrupt file and never writes anything (it runs on every hover, so a
+    /// backup here would spam files). Mutating/launching paths use
+    /// `load_strict`; callers that must not invent the default `personal`
+    /// account (the `cms` CLI) use `try_load`.
+    pub fn load(path: &Path) -> Config {
+        match Config::read(path) {
+            LoadOutcome::Loaded(cfg) => cfg,
+            LoadOutcome::Missing | LoadOutcome::Corrupt(_) => Config::default(),
         }
     }
 
@@ -121,12 +245,41 @@ impl Config {
         serde_json::from_str(&s).map_err(|e| format!("config.json is invalid: {e}"))
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Strict load for the app: a missing file is a legitimate first run
+    /// (defaults); a corrupt one is backed up next to it and surfaced as an
+    /// error, leaving the original untouched so no later save can silently
+    /// replace it with defaults.
+    pub fn load_strict(path: &Path) -> Result<Config, String> {
+        match Config::read(path) {
+            LoadOutcome::Loaded(cfg) => Ok(cfg),
+            LoadOutcome::Missing => Ok(Config::default()),
+            LoadOutcome::Corrupt(reason) => {
+                let note = match backup_corrupt(path) {
+                    Ok(b) => format!("a copy was saved to {}", b.display()),
+                    Err(e) => format!("could not back it up: {e}"),
+                };
+                Err(format!(
+                    "{reason} ({note}). Fix or delete the file to continue."
+                ))
+            }
         }
+    }
+
+    /// Atomic save: write a sibling temp file, fsync, then rename over the
+    /// target, so a crash never leaves `config.json` empty or partial.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(json.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(())
     }
 
     pub fn account(&self, id: &str) -> Option<&Account> {
@@ -135,6 +288,182 @@ impl Config {
 
     pub fn project(&self, id: &str) -> Option<&Project> {
         self.projects.iter().find(|p| p.id == id)
+    }
+}
+
+/// Copies a corrupt `path` to `<path>.corrupt-<timestamp>` (never renames).
+/// Skips the copy when a sibling backup already holds identical bytes, since
+/// strict loads repeat on every click; a name clash gets a `-N` suffix.
+fn backup_corrupt(path: &Path) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(path)?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.json".into());
+    let prefix = format!("{file_name}.corrupt-");
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let p = entry.path();
+        let is_backup = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&prefix));
+        if is_backup && std::fs::read(&p).ok().as_deref() == Some(bytes.as_slice()) {
+            return Ok(p);
+        }
+    }
+    let stamp = chrono::Local::now().format("%Y%m%dT%H%M%S");
+    let mut target = dir.join(format!("{prefix}{stamp}"));
+    let mut n = 1;
+    loop {
+        match create_private_new(&target, &bytes) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                target = dir.join(format!("{prefix}{stamp}-{n}"));
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Writes `bytes` to a brand-new file at `path` (fails with `AlreadyExists`
+/// instead of overwriting), created `0600` on Unix like `config.json` itself:
+/// the backup holds the same account data and must not be more exposed.
+fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
+}
+
+/// Rejects configs where two accounts resolve to the same config dir, which
+/// would break per-account isolation (shared credentials, history, links).
+///
+/// Dirs are compared after `expand_tilde`, ignoring trailing separators and
+/// ASCII case: the default filesystems on macOS (APFS) and Windows (NTFS) are
+/// case-insensitive, so `~/.claude-Work` and `~/.claude-work` are the same
+/// directory there. On case-sensitive Linux this is stricter than necessary,
+/// which is the safe side (two accounts differing only by case are a trap).
+pub fn validate_unique_config_dirs(cfg: &Config) -> Result<(), String> {
+    let mut seen: HashMap<String, &Account> = HashMap::new();
+    for account in &cfg.accounts {
+        if let Some(first) = seen.insert(normalize_config_dir(&account.config_dir), account) {
+            return Err(format!(
+                "Accounts \"{}\" and \"{}\" share the config dir {}; each account needs its own.",
+                first.label,
+                account.label,
+                account.config_dir.trim_end_matches(['/', '\\'])
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Canonical form used to compare config dirs: tilde-expanded, no trailing
+/// separator, lowercased (see `validate_unique_config_dirs` for why).
+fn normalize_config_dir(dir: &str) -> String {
+    let expanded = crate::paths::expand_tilde(dir)
+        .to_string_lossy()
+        .to_string();
+    expanded.trim_end_matches(['/', '\\']).to_lowercase()
+}
+
+/// Finds the account whose `config_dir` is `dir` (e.g. the `CLAUDE_CONFIG_DIR`
+/// a hook runs under). An empty `dir` never matches.
+pub fn find_account_by_dir<'a>(cfg: &'a Config, dir: &str) -> Option<&'a Account> {
+    let wanted = normalize_config_dir(dir);
+    if wanted.is_empty() {
+        return None;
+    }
+    cfg.accounts
+        .iter()
+        .find(|a| normalize_config_dir(&a.config_dir) == wanted)
+}
+
+/// Preferences never edits `inherit_overrides` (only the tray prompt and
+/// `set_inherit_decision` do), so an incoming save must not clobber them: for
+/// every incoming account whose id exists on disk, the disk overrides win.
+/// New accounts keep the incoming (empty) map; accounts absent from `incoming`
+/// are dropped.
+pub fn merge_inherit_overrides(mut incoming: Config, on_disk: &Config) -> Config {
+    for account in &mut incoming.accounts {
+        if let Some(existing) = on_disk.account(&account.id) {
+            account.inherit_overrides = existing.inherit_overrides.clone();
+        }
+    }
+    incoming
+}
+
+/// Everything `save_config` does to the incoming config before persisting it,
+/// as one pure step: keep the on-disk inherit decisions, resolve masked tracking
+/// secrets against the stored ones, then validate tracking on the RESOLVED
+/// values (validating the masked ones would accept a sentinel as a real token).
+pub fn merge_saved_config(incoming: Config, on_disk: &Config) -> Result<Config, String> {
+    let mut merged = merge_inherit_overrides(incoming, on_disk);
+    merged.tracking = crate::tracking::unmask_tracking(&merged.tracking, &on_disk.tracking);
+    crate::tracking::validate_tracking(&merged.tracking)?;
+    Ok(merged)
+}
+
+/// Inserts `decisions` into one account's overrides and returns the merged map.
+pub fn apply_inherit_decisions(
+    cfg: &mut Config,
+    account_id: &str,
+    decisions: &HashMap<String, InheritDecision>,
+) -> Result<HashMap<String, InheritDecision>, String> {
+    let account = cfg
+        .accounts
+        .iter_mut()
+        .find(|a| a.id == account_id)
+        .ok_or("unknown account")?;
+    for (sub, decision) in decisions {
+        account
+            .inherit_overrides
+            .insert(sub.clone(), decision.clone());
+    }
+    Ok(account.inherit_overrides.clone())
+}
+
+/// Process-wide gate for config read-modify-write cycles. Reads are lock-free
+/// (saves are atomic); `update` serializes load → mutate → save. Never hold
+/// the closure across a dialog and never nest `update` calls: `Mutex` is not
+/// reentrant.
+pub struct ConfigStore {
+    path: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl ConfigStore {
+    pub fn new(path: PathBuf) -> Self {
+        ConfigStore {
+            path,
+            lock: Mutex::new(()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<Config, String> {
+        Config::load_strict(&self.path)
+    }
+
+    pub fn update<T>(&self, f: impl FnOnce(&mut Config) -> Result<T, String>) -> Result<T, String> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cfg = Config::load_strict(&self.path)?;
+        let out = f(&mut cfg)?;
+        cfg.save(&self.path).map_err(|e| e.to_string())?;
+        Ok(out)
     }
 }
 
@@ -231,6 +560,44 @@ mod tests {
             usage_limits: UsageLimits::default(),
         };
         assert_eq!(account.logged_in_email(), None);
+    }
+
+    #[test]
+    fn test_should_read_tier_and_org_when_oauth_account_has_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"a@b.c","organizationName":"Acme","organizationRateLimitTier":"default_claude_max_20x","organizationType":"claude_max"}}"#,
+        )
+        .unwrap();
+        let o = read_oauth_account(dir.path()).unwrap();
+        assert_eq!(o.email.as_deref(), Some("a@b.c"));
+        assert_eq!(o.org_name.as_deref(), Some("Acme"));
+        assert_eq!(o.rate_tier.as_deref(), Some("default_claude_max_20x"));
+        assert_eq!(o.org_type.as_deref(), Some("claude_max"));
+    }
+
+    #[test]
+    fn test_should_fall_back_to_user_tier_when_org_tier_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"userRateLimitTier":"default_claude_pro"}}"#,
+        )
+        .unwrap();
+        let o = read_oauth_account(dir.path()).unwrap();
+        assert_eq!(o.rate_tier.as_deref(), Some("default_claude_pro"));
+        assert_eq!(o.org_name, None);
+    }
+
+    #[test]
+    fn test_should_return_none_when_claude_json_is_missing_or_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_oauth_account(dir.path()), None);
+        std::fs::write(dir.path().join(".claude.json"), "{not json").unwrap();
+        assert_eq!(read_oauth_account(dir.path()), None);
+        std::fs::write(dir.path().join(".claude.json"), "{}").unwrap();
+        assert_eq!(read_oauth_account(dir.path()), None);
     }
 
     #[test]
@@ -331,5 +698,556 @@ mod tests {
         assert_eq!(loaded.accounts[0].id, "a");
         assert!(loaded.accounts[0].inherit_overrides.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn cfg_with_dirs(dirs: &[(&str, &str)]) -> Config {
+        Config {
+            accounts: dirs
+                .iter()
+                .map(|(label, dir)| Account {
+                    id: label.to_lowercase(),
+                    label: (*label).into(),
+                    config_dir: (*dir).into(),
+                    inherit_overrides: HashMap::new(),
+                    usage_limits: UsageLimits::default(),
+                })
+                .collect(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn test_should_reject_when_two_accounts_share_config_dir() {
+        let cfg = cfg_with_dirs(&[("Work", "~/.claude-new"), ("Home", "~/.claude-new")]);
+        let err = validate_unique_config_dirs(&cfg).unwrap_err();
+        assert!(err.contains("Work") && err.contains("Home"), "{err}");
+        assert!(err.contains("~/.claude-new"), "{err}");
+    }
+
+    #[test]
+    fn test_should_reject_when_config_dirs_differ_only_by_case() {
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-New"), ("B", "~/.claude-new")]);
+        assert!(validate_unique_config_dirs(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_when_config_dirs_differ_only_by_trailing_slash() {
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-new/"), ("B", "~/.claude-new")]);
+        assert!(validate_unique_config_dirs(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_when_tilde_and_expanded_dir_match() {
+        let home = crate::paths::expand_tilde("~/x");
+        let abs = home.parent().unwrap().join(".claude-new");
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-new"), ("B", abs.to_str().unwrap())]);
+        assert!(validate_unique_config_dirs(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_should_accept_when_config_dirs_are_distinct() {
+        let cfg = cfg_with_dirs(&[("A", "~/.claude-a"), ("B", "~/.claude-b")]);
+        assert!(validate_unique_config_dirs(&cfg).is_ok());
+        assert!(validate_unique_config_dirs(&Config::default()).is_ok());
+    }
+
+    fn corrupt_backups(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("config.json.corrupt-"))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_should_return_defaults_without_backup_when_config_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = Config::load_strict(&path).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert!(corrupt_backups(dir.path()).is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_should_backup_and_err_leaving_file_identical_when_json_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = Config::load_strict(&path).unwrap_err();
+        assert!(err.contains("invalid"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        let backups = corrupt_backups(dir.path());
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{ not json");
+        assert!(err.contains(&backups[0].display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_create_backup_with_0600_when_json_corrupt() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        let backups = corrupt_backups(dir.path());
+        assert_eq!(backups.len(), 1);
+        let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn test_should_not_duplicate_backup_when_strict_load_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        assert!(Config::load_strict(&path).is_err());
+        assert_eq!(corrupt_backups(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn test_should_keep_lenient_load_side_effect_free_when_json_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert_eq!(Config::load(&path), Config::default());
+        assert!(corrupt_backups(dir.path()).is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn test_should_leave_no_temp_file_when_save_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = Config {
+            terminal: "iterm".into(),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["config.json".to_string()]);
+        assert_eq!(Config::try_load(&path).unwrap(), cfg);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_save_config_with_0600_permissions_when_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // Pre-existing file with looser perms: the atomic replace must still yield 0600.
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Config::default().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_keep_old_content_when_save_fails_before_persist() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "old content").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let res = Config::default().save(&path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(res.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old content");
+    }
+
+    #[test]
+    fn test_should_err_without_writing_when_store_update_on_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let store = ConfigStore::new(path.clone());
+        let res: Result<(), String> = store.update(|c| {
+            c.terminal = "x".into();
+            Ok(())
+        });
+        assert!(res.is_err());
+        assert!(store.load().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn test_should_persist_closure_changes_when_store_update_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(dir.path().join("config.json"));
+        let n = store
+            .update(|c| {
+                c.terminal = "iterm".into();
+                Ok(c.accounts.len())
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.load().unwrap().terminal, "iterm");
+    }
+    fn acct(id: &str, dir: &str, ov: &[(&str, InheritDecision)]) -> Account {
+        Account {
+            id: id.into(),
+            label: id.into(),
+            config_dir: dir.into(),
+            inherit_overrides: ov.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            usage_limits: UsageLimits::default(),
+        }
+    }
+
+    // R5.1 S1
+    #[test]
+    fn test_should_default_tracking_to_disabled_when_default_config() {
+        let t = Config::default().tracking;
+        assert!(!t.enabled);
+        assert!(t.ingest_url.is_empty() && t.ingest_token.is_empty());
+    }
+
+    // R5.1 S3
+    #[test]
+    fn test_should_load_with_default_tracking_when_legacy_config_has_no_tracking_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"terminal":"iterm","accounts":[],"projects":[]}"#).unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert_eq!(cfg.tracking, TrackingConfig::default());
+    }
+
+    #[test]
+    fn test_should_default_usage_sources_to_statusline_on_and_endpoint_off() {
+        let u = Config::default().usage;
+        assert!(u.statusline_enabled);
+        assert!(!u.endpoint_enabled);
+    }
+
+    #[test]
+    fn test_should_load_usage_defaults_when_legacy_config_has_no_usage_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"terminal":"iterm","accounts":[],"projects":[]}"#).unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert_eq!(cfg.usage, UsageSourcesConfig::default());
+    }
+
+    #[test]
+    fn test_should_keep_statusline_on_when_usage_object_sets_only_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[],"usage":{"endpoint_enabled":true}}"#,
+        )
+        .unwrap();
+        let u = Config::try_load(&path).unwrap().usage;
+        assert!(u.statusline_enabled && u.endpoint_enabled);
+    }
+
+    #[test]
+    fn test_should_roundtrip_usage_sources_when_saved_and_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        cfg.usage.statusline_enabled = false;
+        cfg.usage.endpoint_enabled = true;
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::try_load(&path).unwrap().usage, cfg.usage);
+    }
+
+    #[test]
+    fn test_should_load_project_with_empty_worktree_roots_when_legacy_config_lacks_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[{"id":"p","label":"P","path":"/a","account":"x"}]}"#,
+        )
+        .unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert!(cfg.projects[0].worktree_roots.is_empty());
+    }
+
+    #[test]
+    fn test_should_round_trip_worktree_roots_when_saved_and_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[{"id":"p","label":"P","path":"/a","account":"x","worktree_roots":["~/w/p"]}]}"#,
+        )
+        .unwrap();
+        let cfg = Config::try_load(&path).unwrap();
+        assert_eq!(cfg.projects[0].worktree_roots, vec!["~/w/p".to_string()]);
+    }
+
+    #[test]
+    fn test_should_load_partial_tracking_when_only_some_fields_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"t","accounts":[],"projects":[],"tracking":{"enabled":true,"ingest_url":"https://x"}}"#,
+        )
+        .unwrap();
+        let t = Config::try_load(&path).unwrap().tracking;
+        assert!(t.enabled);
+        assert_eq!(t.ingest_url, "https://x");
+        assert!(t.grafana_token.is_empty());
+    }
+
+    // R5.7 S13: saved through ConfigStore::update (the only write path)
+    #[cfg(unix)]
+    #[test]
+    fn test_should_persist_tracking_with_0600_when_saved_via_config_store_update() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        Config::default().save(&path).unwrap();
+        let store = ConfigStore::new(path.clone());
+        store
+            .update(|c| {
+                c.tracking.enabled = true;
+                c.tracking.ingest_token = "secret".into();
+                Ok(())
+            })
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let back = Config::try_load(&path).unwrap();
+        assert!(back.tracking.enabled);
+        assert_eq!(back.tracking.ingest_token, "secret");
+    }
+
+    #[test]
+    fn test_should_keep_incoming_tracking_when_merging_inherit_overrides() {
+        let disk = Config::default();
+        let mut incoming = Config::default();
+        incoming.tracking.enabled = true;
+        incoming.tracking.ingest_url = "https://x".into();
+        let merged = merge_inherit_overrides(incoming.clone(), &disk);
+        assert_eq!(merged.tracking, incoming.tracking);
+    }
+
+    // find_account_by_dir (cms --hook account resolution, R7.1 S1-S2)
+    #[test]
+    fn test_should_find_account_when_dir_matches_after_tilde_and_trailing_slash() {
+        let cfg = cfg_with_dirs(&[("Work", "~/.claude-work"), ("Home", "~/.claude-home")]);
+        let dir = crate::paths::expand_tilde("~/.claude-home/");
+        let found = find_account_by_dir(&cfg, &dir.to_string_lossy()).unwrap();
+        assert_eq!(found.id, "home");
+    }
+
+    #[test]
+    fn test_should_not_find_account_when_dir_is_unmatched_or_empty() {
+        let cfg = cfg_with_dirs(&[("Work", "~/.claude-work")]);
+        assert!(find_account_by_dir(&cfg, "/nowhere").is_none());
+        assert!(find_account_by_dir(&cfg, "").is_none());
+    }
+
+    fn cfg_of(accounts: Vec<Account>) -> Config {
+        Config {
+            accounts,
+            ..Config::default()
+        }
+    }
+
+    // S8
+    #[test]
+    fn test_should_keep_disk_overrides_when_incoming_has_none() {
+        let disk = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("agents", InheritDecision::Merge)],
+        )]);
+        let incoming = cfg_of(vec![acct("a", "~/.claude-a", &[])]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        assert_eq!(
+            merged.accounts[0].inherit_overrides.get("agents"),
+            Some(&InheritDecision::Merge)
+        );
+    }
+
+    // S9
+    #[test]
+    fn test_should_start_new_account_with_empty_overrides_when_absent_on_disk() {
+        let disk = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("agents", InheritDecision::Skip)],
+        )]);
+        let incoming = cfg_of(vec![
+            acct("a", "~/.claude-a", &[]),
+            acct("n", "~/.claude-n", &[]),
+        ]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        assert!(merged.account("n").unwrap().inherit_overrides.is_empty());
+    }
+
+    // S10
+    #[test]
+    fn test_should_drop_account_when_absent_from_incoming() {
+        let disk = cfg_of(vec![
+            acct("a", "~/.claude-a", &[]),
+            acct("d", "~/.claude-d", &[]),
+        ]);
+        let incoming = cfg_of(vec![acct("a", "~/.claude-a", &[])]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        assert!(merged.account("d").is_none());
+    }
+
+    // S11
+    #[test]
+    fn test_should_keep_overrides_by_id_when_config_dir_changes() {
+        let disk = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("skills", InheritDecision::Skip)],
+        )]);
+        let incoming = cfg_of(vec![acct("a", "~/.claude-renamed", &[])]);
+        let merged = merge_inherit_overrides(incoming, &disk);
+        let a = merged.account("a").unwrap();
+        assert_eq!(a.config_dir, "~/.claude-renamed");
+        assert_eq!(
+            a.inherit_overrides.get("skills"),
+            Some(&InheritDecision::Skip)
+        );
+    }
+
+    // S12
+    #[test]
+    fn test_should_save_with_empty_overrides_when_legacy_file_lacks_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal":"iterm","accounts":[{"id":"a","label":"A","config_dir":"~/.claude-a"}],"projects":[]}"#,
+        )
+        .unwrap();
+        let store = ConfigStore::new(path);
+        let incoming = store.load().unwrap();
+        store
+            .update(|d| {
+                *d = merge_inherit_overrides(incoming, d);
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.load().unwrap().accounts[0]
+            .inherit_overrides
+            .is_empty());
+    }
+
+    #[test]
+    fn test_should_insert_and_return_merged_map_when_applying_decisions() {
+        let mut cfg = cfg_of(vec![acct(
+            "a",
+            "~/.claude-a",
+            &[("agents", InheritDecision::Merge)],
+        )]);
+        let mut new = HashMap::new();
+        new.insert("skills".to_string(), InheritDecision::Skip);
+        let merged = apply_inherit_decisions(&mut cfg, "a", &new).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(cfg.accounts[0].inherit_overrides, merged);
+    }
+
+    #[test]
+    fn test_should_err_when_applying_decisions_to_unknown_account() {
+        let mut cfg = Config::default();
+        let err = apply_inherit_decisions(&mut cfg, "nope", &HashMap::new()).unwrap_err();
+        assert!(err.contains("unknown account"));
+    }
+
+    // S13
+    #[test]
+    fn test_should_keep_all_updates_when_threads_update_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ConfigStore::new(dir.path().join("config.json")));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .update(|c| {
+                            c.accounts.push(acct(&format!("t{i}"), "~/.claude-t", &[]));
+                            Ok(())
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // default "personal" + 8 pushed
+        assert_eq!(store.load().unwrap().accounts.len(), 9);
+    }
+
+    // merge_saved_config (R8.2 S3)
+    fn tracked(token: &str) -> Config {
+        let mut c = Config::default();
+        c.tracking.enabled = true;
+        c.tracking.ingest_url = "https://cm.example.workers.dev".into();
+        c.tracking.ingest_token = token.into();
+        c.tracking.grafana_token = "glc".into();
+        c
+    }
+
+    #[test]
+    fn test_should_keep_stored_tokens_when_saving_a_masked_config() {
+        let disk = tracked("secret-1");
+        let masked = Config {
+            tracking: crate::tracking::mask_tracking(&disk.tracking),
+            ..disk.clone()
+        };
+        let merged = merge_saved_config(masked, &disk).unwrap();
+        assert_eq!(merged, disk);
+    }
+
+    #[test]
+    fn test_should_never_store_sentinel_when_enabling_without_a_stored_token() {
+        let disk = Config::default(); // nothing stored
+        let mut incoming = tracked(crate::tracking::TOKEN_MASK);
+        incoming.tracking.grafana_token.clear();
+        let err = merge_saved_config(incoming, &disk).unwrap_err();
+        assert!(err.contains("ingest token"), "{err}");
+    }
+
+    #[test]
+    fn test_should_save_new_token_when_user_typed_one() {
+        let disk = tracked("old");
+        let mut incoming = disk.clone();
+        incoming.tracking.ingest_token = "brand-new".into();
+        let merged = merge_saved_config(incoming, &disk).unwrap();
+        assert_eq!(merged.tracking.ingest_token, "brand-new");
+    }
+
+    #[test]
+    fn test_should_keep_inherit_overrides_from_disk_when_merging_saved_config() {
+        let mut disk = tracked("t");
+        disk.accounts[0]
+            .inherit_overrides
+            .insert("agents".into(), InheritDecision::Merge);
+        let incoming = Config {
+            tracking: crate::tracking::mask_tracking(&disk.tracking),
+            accounts: Config::default().accounts,
+            ..disk.clone()
+        };
+        let merged = merge_saved_config(incoming, &disk).unwrap();
+        assert_eq!(
+            merged.accounts[0].inherit_overrides.get("agents"),
+            Some(&InheritDecision::Merge)
+        );
     }
 }

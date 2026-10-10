@@ -9,11 +9,17 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "preview": "vite preview",
     "tauri": "tauri",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
+    "build:app": "tauri build --config src-tauri/tauri.bundle.conf.json",
     "install-cli": "cd src-tauri && cargo build --release --bin cms && mkdir -p \"$HOME/.local/bin\" && rm -f \"$HOME/.local/bin/cms\" && cp \"$(pwd)/target/release/cms\" \"$HOME/.local/bin/cms\" && echo 'cms installed to ~/.local/bin/cms (re-run install-cli after rebuilding)' && case \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) echo 'warning: ~/.local/bin is not in your PATH — add it to your shell profile' ;; esac"
   },
   "dependencies": {
+    "@fontsource-variable/bricolage-grotesque": "^5.3.0",
+    "@fontsource-variable/figtree": "^5.3.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
@@ -26,6 +32,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^5.0.3"
   }
 }

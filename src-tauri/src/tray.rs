@@ -1,10 +1,15 @@
-use crate::{commands, config::Config, paths, session, usage};
+use crate::{
+    commands,
+    config::{Config, Project},
+    paths, session, usage,
+};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri_plugin_dialog::DialogExt;
 
 #[derive(Debug, PartialEq)]
 pub enum MenuAction {
     Launch { account: String, project: String },
+    OpenInOrca { account: String, project: String },
     Session { account: String },
     Login { account: String },
     Logout { account: String },
@@ -18,6 +23,10 @@ pub fn parse_menu_id(id: &str) -> MenuAction {
     let parts: Vec<&str> = id.split("::").collect();
     match parts.as_slice() {
         ["launch", a, p] => MenuAction::Launch {
+            account: a.to_string(),
+            project: p.to_string(),
+        },
+        ["orca", a, p] => MenuAction::OpenInOrca {
             account: a.to_string(),
             project: p.to_string(),
         },
@@ -36,6 +45,39 @@ pub fn parse_menu_id(id: &str) -> MenuAction {
         ["prefs"] => MenuAction::Prefs,
         ["quit"] => MenuAction::Quit,
         _ => MenuAction::Unknown,
+    }
+}
+
+/// Menu id of an "Open in Orca" item; `parse_menu_id` round-trips it.
+pub(crate) fn orca_menu_id(account_id: &str, project_id: &str) -> String {
+    format!("orca::{account_id}::{project_id}")
+}
+
+/// `(id, label)` of the "Open in Orca" submenu entries for one account: one per
+/// project, and none at all when Orca isn't available (not macOS / not installed).
+pub(crate) fn orca_menu_entries(
+    available: bool,
+    account_id: &str,
+    projects: &[&Project],
+) -> Vec<(String, String)> {
+    if !available {
+        return Vec::new();
+    }
+    projects
+        .iter()
+        .map(|p| (orca_menu_id(account_id, &p.id), p.label.clone()))
+        .collect()
+}
+
+/// Orca is only integrated on macOS, and only when its CLI is installed.
+fn orca_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new(crate::orca::source::CLI_PATH).is_file()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
@@ -75,9 +117,22 @@ fn build_menu(
                     &MenuItemBuilder::with_id(format!("session::{}", account.id), "New session")
                         .build(app)?,
                 );
-                for project in cfg.projects.iter().filter(|p| p.account == account.id) {
+                let projects: Vec<&Project> = cfg
+                    .projects
+                    .iter()
+                    .filter(|p| p.account == account.id)
+                    .collect();
+                for project in &projects {
                     let id = format!("launch::{}::{}", account.id, project.id);
                     sub = sub.item(&MenuItemBuilder::with_id(id, &project.label).build(app)?);
+                }
+                let orca_entries = orca_menu_entries(orca_available(), &account.id, &projects);
+                if !orca_entries.is_empty() {
+                    let mut orca_sub = SubmenuBuilder::new(app, "Open in Orca");
+                    for (id, label) in orca_entries {
+                        orca_sub = orca_sub.item(&MenuItemBuilder::with_id(id, label).build(app)?);
+                    }
+                    sub = sub.item(&orca_sub.build()?);
                 }
                 sub = sub.separator();
                 let status_id = format!("status::{}", account.id);
@@ -157,6 +212,8 @@ fn build_menu(
         .build()
 }
 
+// Lenient `Config::load` below is intentional: the tray renders on every hover
+// and must never write (no backups) or lock; mutating paths use `ConfigStore`.
 pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::tray::{TrayIconBuilder, TrayIconEvent};
     let cfg = Config::load(&paths::config_file_path(app.handle()));
@@ -176,6 +233,16 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                     if let Err(msg) = commands::launch_session(app.clone(), account, project) {
                         show_err(msg);
                     }
+                }
+                MenuAction::OpenInOrca { account, project } => {
+                    // Off the main thread: the Orca handshake can take up to
+                    // ~45s and must never freeze the tray.
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        if let Err(msg) = commands::open_in_orca(&app, &account, &project) {
+                            app.dialog().message(msg).title("claude-multi").show(|_| {});
+                        }
+                    });
                 }
                 MenuAction::Session { account } => {
                     if let Err(msg) = commands::open_session(app.clone(), account) {
@@ -291,6 +358,78 @@ mod tests {
             MenuAction::Session {
                 account: "personal".into()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod orca_tests {
+    use super::*;
+    use crate::config::Project;
+
+    fn project(id: &str, label: &str) -> Project {
+        Project {
+            id: id.into(),
+            label: label.into(),
+            path: "/Users/test/code/repo-a".into(),
+            account: "a".into(),
+            worktree_roots: vec![],
+        }
+    }
+
+    #[test]
+    fn test_should_roundtrip_orca_menu_id_when_special_chars() {
+        for (account, proj) in [
+            ("personal", "p1"),
+            ("my acct", "p 2"),
+            ("a'b\"c", "p$x`y`"),
+            ("ñandú-é", "日本"),
+            ("a:b", "p:1"),
+        ] {
+            let id = orca_menu_id(account, proj);
+            assert_eq!(
+                parse_menu_id(&id),
+                MenuAction::OpenInOrca {
+                    account: account.into(),
+                    project: proj.into()
+                },
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_not_confuse_orca_id_with_launch_id() {
+        assert_eq!(
+            parse_menu_id("launch::a::p"),
+            MenuAction::Launch {
+                account: "a".into(),
+                project: "p".into()
+            }
+        );
+        assert_eq!(parse_menu_id("orca::only-one"), MenuAction::Unknown);
+    }
+
+    #[test]
+    fn test_should_hide_orca_item_when_not_installed() {
+        let p = project("p1", "Repo A");
+        assert!(orca_menu_entries(false, "a", &[&p]).is_empty());
+    }
+
+    #[test]
+    fn test_should_hide_orca_item_when_account_has_no_projects() {
+        assert!(orca_menu_entries(true, "a", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_should_list_one_entry_per_project_when_orca_available() {
+        let (p1, p2) = (project("p1", "Repo A"), project("p2", "Repo B"));
+        assert_eq!(
+            orca_menu_entries(true, "a", &[&p1, &p2]),
+            vec![
+                ("orca::a::p1".to_string(), "Repo A".to_string()),
+                ("orca::a::p2".to_string(), "Repo B".to_string()),
+            ]
         );
     }
 }

@@ -1,7 +1,8 @@
 name: Release
 
 # Trigger on a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
-# The `quality` job (lint + tests + dependency audits) must pass before any
+# The `quality` job (lint + tests + dependency audits) and the `cross-os`
+# job (clippy + tests on macOS and Windows) must pass before any
 # platform is built and uploaded to the GitHub Release.
 on:
   push:
@@ -76,13 +77,59 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
+  # Clippy + tests on the platforms the app ships for besides Linux. Most of
+  # the OS-specific code (`#[cfg(windows)]`, Keychain, PowerShell builders) is
+  # invisible to the Ubuntu job. Audits and rustfmt stay in `quality`.
+  cross-os:
+    name: Clippy & test (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # tauri::generate_context! needs ../dist to exist at compile time.
+      - name: Build frontend (tsc + vite)
+        run: npm run build
+
+      - name: Clippy (deny warnings)
+        shell: bash
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rust tests
+        shell: bash
+        working-directory: src-tauri
+        run: cargo test
+
   # One release object, created before any platform builds. Letting each
   # matrix job create its own release races: in v0.6.0 four concurrent jobs
   # produced two drafts for the same tag, splitting the nine installers
   # across them. The build job below uploads into this id instead.
   create-release:
     name: Create draft release
-    needs: quality
+    needs: [quality, cross-os]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
@@ -112,7 +159,7 @@ jobs:
 
   release:
     name: Build & release (${{ matrix.platform }} ${{ matrix.args }})
-    needs: [quality, create-release]
+    needs: [quality, cross-os, create-release]
     # Only build/publish on a version tag. A manual workflow_dispatch from a
     # branch runs just the `quality` gate (no bogus release is created).
     if: startsWith(github.ref, 'refs/tags/v')
@@ -196,7 +243,10 @@ jobs:
           # releaseId (instead of tagName/releaseName) is what keeps the
           # concurrent matrix jobs from each creating their own draft.
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          args: ${{ matrix.args }}
+          # The overlay adds the `cms` sidecar (externalBin) and builds it via
+          # scripts/build-sidecar.mjs; it is kept out of tauri.conf.json so
+          # `cargo test`/`clippy` don't need the staged binary.
+          args: --config src-tauri/tauri.bundle.conf.json ${{ matrix.args }}
 
       # v0.6.0 shipped a bundle whose only executable was the `cms` CLI — with
       # two bin targets the bundler picked the wrong one, and every job still
@@ -218,5 +268,22 @@ jobs:
           fi
           if ! otool -L "$APP/Contents/MacOS/$EXEC" | grep -q WebKit.framework; then
             echo "bundled '$EXEC' does not link WebKit — it is not the tray app" >&2
+            exit 1
+          fi
+          # The cms sidecar must sit next to the app (Tauri strips the target
+          # triple), be executable, be a different binary than the app, and
+          # target the same architecture. (It also links WebKit, because the
+          # shared lib pulls in tauri, so WebKit cannot tell the two apart.)
+          CMS="$APP/Contents/MacOS/cms"
+          if [ ! -x "$CMS" ]; then
+            echo "sidecar 'cms' is missing or not executable in $APP/Contents/MacOS" >&2
+            exit 1
+          fi
+          if cmp -s "$CMS" "$APP/Contents/MacOS/$EXEC"; then
+            echo "bundled 'cms' is identical to '$EXEC' — wrong sidecar" >&2
+            exit 1
+          fi
+          if [ "$(lipo -archs "$CMS")" != "$(lipo -archs "$APP/Contents/MacOS/$EXEC")" ]; then
+            echo "bundled 'cms' architecture differs from '$EXEC'" >&2
             exit 1
           fi

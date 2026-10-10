@@ -248,6 +248,24 @@ missing project path (see step 15).
 
 ---
 
+## Config robustness
+
+- [ ] **Corrupt config is preserved:** quit the app, replace `config.json` with
+      invalid JSON (e.g. `{ nope`) and launch. The tray still opens; a backup copy
+      of the corrupt file appears next to it; the original file is **byte-identical**
+      (not reset to the default account).
+- [ ] **Error shown in Preferences:** with the corrupt file in place, open
+      Preferences → a clear error about the invalid `config.json` is displayed
+      (no silent default `personal` account). Saving does not overwrite the file.
+- [ ] **Recovery:** fix or delete the file, relaunch → Preferences loads normally.
+- [ ] **Inherit decision survives Save:** in the Inheritance panel click **Skip**
+      on a row, then without reloading edit anything (e.g. a label) and click
+      **Save**. Re-open the panel → the row is still `skipped` and
+      `inherit_overrides` in `config.json` still records it.
+- [ ] **Permissions (macOS/Linux):** `config.json` is mode `0600` after a save.
+
+---
+
 ## cms CLI
 
 - [ ] `cms --list` shows all configured accounts with logged-in emails.
@@ -255,6 +273,37 @@ missing project path (see step 15).
 - [ ] `cms nope` exits non-zero listing available accounts.
 - [ ] `cms <logged-out-account>` refuses with the tray login hint before starting claude.
 - [ ] Trailing args pass through: `cms <account> --help` prints claude's help.
+
+---
+
+## Orca integration (macOS, Orca installed)
+
+Never point these at real work you care about: step 3 opens a real Orca terminal.
+
+- [ ] `cms --version` prints `cms <version>` matching Preferences' app version.
+- [ ] **Health panel** (MANUAL 3.5): Preferences -> Orca -> **Check** shows rows
+      for cms on PATH, same binary, agent command, managed accounts, unmapped
+      repos, data source. Quit Orca and Check again: the panel still renders,
+      with Orca-dependent rows as "unavailable" warnings (not failures) and the
+      data source reported as the SQLite snapshot.
+- [ ] **Import dry run** (MANUAL 4.5): **Import from Orca...** lists candidates
+      with sensible worktree roots; already-mapped repos are disabled. Import
+      into a scratch config (or one repo, then discard with Save left unpressed
+      / remove it). Verify Orca's data dir is untouched: `Library/Application
+      Support/orca/` mtimes do not change because of the dialog.
+- [ ] **Open in Orca** (MANUAL 5.7), with Orca running: tray -> account -> Open
+      in Orca -> project. A focused Orca terminal opens running `cms <account>`
+      (`echo $CLAUDE_CONFIG_DIR` in Claude Code `/status` shows that account).
+      Repeat with (a) a project whose path IS an Orca repo, and (b) one under a
+      worktree root / `.nosync` symlink; confirm Orca's `path:` selector accepts
+      it, or that the dialog shows the "must be an Orca repo or worktree" hint.
+- [ ] Same with Orca fully quit: Orca launches, then the terminal opens
+      (a "didn't become ready" dialog is acceptable if Orca takes longer than 3 s;
+      retry works).
+- [ ] The tray stays responsive while Orca starts (no beachball).
+- [ ] With Orca not installed (rename the app temporarily): no Orca card, no
+      "Open in Orca" submenu, no errors.
+- [ ] Fixtures/docs contain no real project names or personal paths.
 
 ---
 
@@ -271,11 +320,81 @@ never publish a draft whose bundle nobody opened.
 - [ ] macOS: mount the `aarch64.dmg` and confirm
       `Contents/MacOS/claude-multi` exists and is ~10 MB (`plutil -extract
       CFBundleExecutable raw .../Info.plist` prints `claude-multi`, and
-      `otool -L` on it lists `WebKit.framework` — the CLI links neither).
+      `otool -L` on it lists `WebKit.framework`; the bundled `cms` sidecar links it too, so rely on `CFBundleExecutable`, not on WebKit, to tell them apart).
 - [ ] Install that build and launch it: the tray icon appears and its menu
       lists the configured accounts.
 - [ ] `defaults read /Applications/claude-multi.app/Contents/Info.plist
       CFBundleShortVersionString` matches the tag.
+
+---
+
+## Session tracking (requires the cloud setup in `cloud/README.md`)
+
+Use a throwaway account and Claude Code >= 2.1.212.
+
+- [ ] Preferences -> Tracking: fill ingest URL + token (and optionally the
+      Grafana fields) -> **Test connection**. Expect "Connected: ingest
+      reachable, token accepted." A wrong token shows the 401 message; a wrong
+      URL the 404 message; an old `claude` shows a version warning.
+- [ ] Save, reopen Preferences: both token fields show the mask, not the real
+      value. Save again without touching them: Test connection still passes
+      (the stored token was kept).
+- [ ] Tick **Enabled**, Save. The account's `<config_dir>/settings.json` now has
+      `SessionStart` and `SessionEnd` entries running `cms --hook start|end`;
+      any hooks you already had are still there.
+- [ ] Launch a session from the tray (and one with `cms <account>`). Shortly after
+      a row appears in the dashboard with the account, host, cwd/project, git
+      branch, public IP and **geo** (country/city). Origin shows `tray` / `cms`.
+- [ ] Send a prompt: counts, tokens and cost increase on the row.
+- [ ] End the session (`/exit`). The row becomes *ended* with the end reason.
+- [ ] With **AI summary** on: a summary appears on the session detail a short
+      while after the end, even if you closed the terminal right away.
+- [ ] Take the network offline, run and end a session, go back online and start
+      another: the earlier events show up (spooled, then flushed).
+- [ ] Untick **Enabled**, Save: the `cms --hook` entries are gone from every
+      account's `settings.json` (your own hooks untouched); a new session sends
+      nothing.
+- [ ] The dashboard URL (and a preview/version URL) is not reachable without
+      passing Cloudflare Access.
+- [ ] Bundled app only: `Contents/MacOS/cms` exists next to `claude-multi`,
+      and the app still starts as a tray app.
+
+---
+
+## UX overhaul (tabs, rooms, real usage)
+
+Use a throwaway account that is logged in. Statusline checks need Claude Code
+and a terminal (tmux works well for driving the TUI).
+
+- [ ] Preferences opens on the **Accounts** tab; tabs are Accounts, Projects,
+      Tracking, Settings (and Orca only when Orca is installed). Reopen: the
+      last tab used is selected.
+- [ ] Edit an account label, switch tabs and back: the edit is still there. One
+      **Save** persists everything. A duplicated config dir puts a marker on its
+      tab, disables Save and the footer names that tab.
+- [ ] Fonts offline: turn the network off, reopen Preferences. Text renders in
+      Figtree and headings in Bricolage Grotesque, and devtools shows no
+      external font requests.
+- [ ] Rooms: a logged-in account shows its email, vessels and actions; a
+      logged-out account shows the empty room with a primary **Log in**; an
+      expired one offers **Log in again**. No Session/Week ceiling inputs exist.
+- [ ] Statusline install: with **Use the statusline to read real usage** on, the
+      account's `<config_dir>/settings.json` has a `statusLine` command
+      `'<path>/cms' --statusline`. If you had your own statusline, it is saved in
+      `<config_dir>/.claude-multi-statusline.json` (mode 0600).
+- [ ] Statusline chain: open `claude` under the account, send one prompt. Your own
+      statusline still renders as before, and `<app data>/usage/<hash8>.json`
+      appears with mode 0600.
+- [ ] The Accounts tab shows the same 5h/7d percentages as the statusline, the
+      plan chip (for example Max 20x) and pacing chips; "Updated ..." shows the
+      reading's age.
+- [ ] Statusline uninstall: turn the toggle off and Save. `settings.json`
+      `statusLine` equals your original value again (or is gone if you had none),
+      the sidecar is deleted, and the default `~/.claude` is untouched.
+- [ ] Account API (off by default): with the switch off, no network request is
+      made for usage. Turn it on: the warning text is visible in Settings, the
+      room gains a per-model vessel (for example Fable) and an "Account API"
+      source chip. Turn it off: the extra vessel disappears.
 
 ---
 

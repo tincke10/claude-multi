@@ -1,9 +1,21 @@
-use crate::config::{Config, InheritDecision};
+use crate::config::{
+    apply_inherit_decisions, merge_saved_config, Config, ConfigStore, InheritDecision,
+};
+use crate::hooks_install::{self, HookPolicy};
+use crate::overview::{self, AccountOverview};
 use crate::paths::expand_tilde;
-use crate::{adapters, inherit, launcher, paths, session};
+use crate::statusline_install;
+use crate::{adapters, inherit, launcher, session, tracking, tracking_check, usage};
 use serde::Serialize;
-use tauri::AppHandle;
+use std::collections::HashMap;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+
+/// Strict config load through the process-wide store: a corrupt `config.json`
+/// is an error (and is backed up), never silently replaced by defaults.
+fn load_config(app: &AppHandle) -> Result<Config, String> {
+    app.state::<ConfigStore>().load()
+}
 
 /// Ask the user, once per subdir, whether to merge the shared resources into an
 /// account that already has its own. Returns the chosen decision.
@@ -30,17 +42,58 @@ fn prompt_inherit_decision(app: &AppHandle, account_id: &str, subdir: &str) -> I
     }
 }
 
+/// Prepare one account's config dir before launch: inherit `~/.claude`
+/// resources, then (strictly after, so a hook-created settings.json can't block
+/// seeding) sync the tracking hooks. A hook failure never blocks the launch.
+fn ensure_account_inherits(app: &AppHandle, account_id: &str) -> Result<(), String> {
+    inherit_account(app, account_id)?;
+    sync_account_hooks(app, account_id);
+    // After the seed: the user's seeded statusLine is what gets preserved.
+    sync_account_statusline(app, account_id);
+    Ok(())
+}
+
+/// Best-effort install/remove of the tracking hooks for one account. The
+/// tray owns the canonical cms path, so an existing entry is rewritten.
+fn sync_account_hooks(app: &AppHandle, account_id: &str) {
+    let Ok(cfg) = load_config(app) else { return };
+    let Some(account) = cfg.account(account_id) else {
+        return;
+    };
+    let dir = expand_tilde(&account.config_dir);
+    if let Err(e) = hooks_install::sync_account(&dir, cfg.tracking.enabled, HookPolicy::Replace) {
+        eprintln!("tracking hooks sync failed for account '{account_id}': {e}");
+    }
+}
+
+/// Best-effort install/remove of the usage statusline for one account (the
+/// tray owns the canonical cms path, so an existing entry is rewritten).
+fn sync_account_statusline(app: &AppHandle, account_id: &str) {
+    let Ok(cfg) = load_config(app) else { return };
+    let Some(account) = cfg.account(account_id) else {
+        return;
+    };
+    let dir = expand_tilde(&account.config_dir);
+    if let Err(e) =
+        statusline_install::sync_account(&dir, cfg.usage.statusline_enabled, HookPolicy::Replace)
+    {
+        eprintln!("usage statusline sync failed for account '{account_id}': {e}");
+    }
+}
+
 /// Ensure one account's config dir inherits `~/.claude` resources before launch.
 /// Prompts once per unresolved conflict, persists the decision, then re-applies.
 /// No-op (Ok) when `~/.claude` doesn't exist.
-fn ensure_account_inherits(app: &AppHandle, account_id: &str) -> Result<(), String> {
+fn inherit_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
     let source = expand_tilde("~/.claude");
     if !source.is_dir() {
         return Ok(()); // nothing to inherit from
     }
 
-    let cfg_path = paths::config_file_path(app);
-    let mut cfg = Config::load(&cfg_path);
+    // Lock-free read: the config lock must never be held across the blocking
+    // prompt below (sync commands and tray events share the main thread and
+    // `Mutex` is not reentrant).
+    let cfg = load_config(app)?;
 
     let config_dir = expand_tilde(&cfg.account(account_id).ok_or("unknown account")?.config_dir);
     let decisions = cfg
@@ -66,17 +119,17 @@ fn ensure_account_inherits(app: &AppHandle, account_id: &str) -> Result<(), Stri
         return Ok(());
     }
 
-    // Prompt once per conflicted subdir, then persist and re-apply.
-    let mut new_decisions = decisions;
+    // Prompt once per conflicted subdir (no lock held), then persist only the
+    // new decisions through the store so concurrent edits are merged, not lost.
+    let mut prompted = HashMap::new();
     for sub in &outcome.needs_prompt {
-        new_decisions.insert(sub.clone(), prompt_inherit_decision(app, account_id, sub));
+        prompted.insert(sub.clone(), prompt_inherit_decision(app, account_id, sub));
     }
-    if let Some(account) = cfg.accounts.iter_mut().find(|a| a.id == account_id) {
-        account.inherit_overrides = new_decisions.clone();
-    }
-    cfg.save(&cfg_path).map_err(|e| e.to_string())?;
+    let merged = app
+        .state::<ConfigStore>()
+        .update(|c| apply_inherit_decisions(c, account_id, &prompted))?;
 
-    inherit::ensure_inherited(&source, &config_dir, &new_decisions).map_err(|e| e.to_string())?;
+    inherit::ensure_inherited(&source, &config_dir, &merged).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -95,27 +148,6 @@ fn validate_project_dir(label: &str, path: &std::path::Path) -> Result<(), Strin
     }
 }
 
-/// Builds the paste-able fallback command: `CLAUDE_CONFIG_DIR='…' sh -c "<inner>"`.
-fn manual_sh(config_dir: &str, inner: &str) -> String {
-    format!("CLAUDE_CONFIG_DIR='{config_dir}' sh -c \"{inner}\"")
-}
-
-pub fn manual_command(config_dir: &str, project_path: &str) -> String {
-    manual_sh(config_dir, &format!("cd '{project_path}' && exec claude"))
-}
-
-pub fn manual_login_command(config_dir: &str) -> String {
-    manual_sh(config_dir, "exec claude")
-}
-
-pub fn manual_logout_command(config_dir: &str) -> String {
-    manual_sh(config_dir, "claude auth logout")
-}
-
-pub fn manual_relogin_command(config_dir: &str) -> String {
-    manual_sh(config_dir, "claude auth logout; claude auth login")
-}
-
 #[derive(Serialize)]
 pub struct TerminalInfo {
     pub id: String,
@@ -123,19 +155,171 @@ pub struct TerminalInfo {
 }
 
 #[tauri::command]
-pub fn get_config(app: AppHandle) -> Config {
-    Config::load(&paths::config_file_path(&app))
+pub fn get_config(app: AppHandle) -> Result<Config, String> {
+    // Secrets never reach the webview: tokens go out masked (see `tracking::TOKEN_MASK`).
+    let mut cfg = load_config(&app)?;
+    cfg.tracking = tracking::mask_tracking(&cfg.tracking);
+    Ok(cfg)
 }
 
+/// Returns non-fatal warnings (e.g. tracking hooks that could not be
+/// installed/removed for some accounts); the config itself is always saved
+/// first.
 #[tauri::command]
-pub fn save_config(app: AppHandle, config: Config) -> Result<(), String> {
-    config
-        .save(&paths::config_file_path(&app))
-        .map_err(|e| e.to_string())?;
-    // Rebuild the tray menu so changes apply immediately, no restart needed.
+pub fn save_config(app: AppHandle, config: Config) -> Result<Vec<String>, String> {
+    // Reject before taking the store lock: pure check, nothing to persist yet.
+    crate::config::validate_unique_config_dirs(&config)?;
+    // Preferences never edits inherit_overrides: keep whatever is on disk (a
+    // tray-prompt decision may have landed since the UI loaded its copy). Masked
+    // tracking tokens resolve to the stored ones and tracking is validated on
+    // the resolved values; an Err here aborts before anything is written.
+    let (was_enabled, now_enabled, statusline_was, statusline_now, dirs) =
+        app.state::<ConfigStore>().update(|disk| {
+            let was_enabled = disk.tracking.enabled;
+            let statusline_was = disk.usage.statusline_enabled;
+            *disk = merge_saved_config(config, disk)?;
+            let dirs: Vec<_> = disk
+                .accounts
+                .iter()
+                .map(|a| expand_tilde(&a.config_dir))
+                .collect();
+            Ok((
+                was_enabled,
+                disk.tracking.enabled,
+                statusline_was,
+                disk.usage.statusline_enabled,
+                dirs,
+            ))
+        })?;
+    // Rebuild (after the lock is released) the tray menu so changes apply immediately, no restart needed.
     let _ = crate::tray::refresh_tray(&app);
-    Ok(())
+
+    // Tracking toggled: install/remove hooks for every account. File I/O runs
+    // outside the store lock; failures are reported, never fatal to Save.
+    let mut warnings = if was_enabled != now_enabled {
+        hooks_install::sync_all(&dirs, now_enabled, HookPolicy::Replace)
+    } else {
+        Vec::new()
+    };
+    // Same for the usage statusline toggle (off = uninstall + restore).
+    if statusline_was != statusline_now {
+        warnings.extend(statusline_install::sync_all(
+            &dirs,
+            statusline_now,
+            HookPolicy::Replace,
+        ));
+    }
+    Ok(warnings)
 }
+
+/// Connectivity check for the Preferences "Test connection" button. Runs on a
+/// blocking thread (network + a version probe) so the UI thread never stalls.
+/// Masked tokens resolve against the stored ones; the result carries no secrets.
+#[tauri::command]
+pub async fn test_tracking_connection(
+    app: AppHandle,
+    tracking: crate::config::TrackingConfig,
+) -> Result<tracking_check::TrackingCheck, String> {
+    let stored = load_config(&app)?.tracking;
+    let resolved = tracking::unmask_tracking(&tracking, &stored);
+    tauri::async_runtime::spawn_blocking(move || {
+        tracking_check::run_check(
+            &resolved,
+            &tracking_check::probe,
+            crate::cms_path::resolve(),
+            tracking_check::detect_claude_version(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Orca integration health for the Preferences panel. Read-only; runs on a
+/// blocking thread (login-shell probe + Orca CLI). Off macOS the whole
+/// integration is hidden (`supported: false`).
+#[tauri::command]
+pub async fn orca_health(app: AppHandle) -> Result<crate::orca::health::OrcaHealth, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Lock-free read: never hold the config lock across the probes.
+        let cfg = load_config(&app)?;
+        tauri::async_runtime::spawn_blocking(move || crate::orca::probe::health_system(&cfg))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(crate::orca::health::OrcaHealth {
+            supported: false,
+            checks: Vec::new(),
+        })
+    }
+}
+
+/// Import dialog data: Orca repos not yet covered by a project. Read-only.
+#[tauri::command]
+pub async fn list_orca_import_candidates(
+    app: AppHandle,
+) -> Result<crate::orca::import::ImportList, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Lock-free config read; the Orca CLI call below can take seconds.
+        let cfg = load_config(&app)?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let home = dirs::home_dir().ok_or("no home directory")?;
+            let paths = crate::orca::source::OrcaPaths::system(&home);
+            crate::orca::import::list_candidates(&cfg, &home, &|| {
+                crate::orca::source::read_snapshot(&paths)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err(ORCA_MACOS_ONLY.to_string())
+    }
+}
+
+/// Imports the chosen Orca repos as projects. Returns the added projects so
+/// the open Preferences window can append them to its local state (a reload
+/// would drop its unsaved edits). Orca is read before, and duplicates are
+/// re-checked inside, the config lock.
+#[tauri::command]
+pub async fn import_orca_repos(
+    app: AppHandle,
+    selections: Vec<crate::orca::plan::ImportSelection>,
+) -> Result<Vec<crate::config::Project>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let handle = app.clone();
+        let added = tauri::async_runtime::spawn_blocking(move || {
+            let home = dirs::home_dir().ok_or("no home directory")?;
+            let paths = crate::orca::source::OrcaPaths::system(&home);
+            crate::orca::import::import_repos(
+                &handle.state::<ConfigStore>(),
+                &home,
+                &selections,
+                &|| crate::orca::source::read_snapshot(&paths),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        // After the lock is released, like `save_config`.
+        let _ = crate::tray::refresh_tray(&app);
+        Ok(added)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, selections);
+        Err(ORCA_MACOS_ONLY.to_string())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+const ORCA_MACOS_ONLY: &str = "The Orca integration is only available on macOS.";
 
 #[tauri::command]
 pub fn list_terminals() -> Vec<TerminalInfo> {
@@ -154,7 +338,7 @@ pub fn launch_session(
     account_id: String,
     project_id: String,
 ) -> Result<(), String> {
-    let cfg = Config::load(&paths::config_file_path(&app));
+    let cfg = load_config(&app)?;
     let account = cfg.account(&account_id).ok_or("unknown account")?;
     let project = cfg.project(&project_id).ok_or("unknown project")?;
     let adapter = adapters::find_adapter(&cfg.terminal).ok_or("unknown terminal")?;
@@ -169,16 +353,56 @@ pub fn launch_session(
     let cd = config_dir.to_string_lossy();
     let pp = project_path.to_string_lossy();
 
-    let script = launcher::build_script(adapter.kind, &cd, &pp);
+    // Tracking env carries secrets: only the temp script gets it, never the
+    // clipboard fallback below.
+    let tracking_env = tracking::tracking_env(
+        &cfg.tracking,
+        &account.id,
+        tracking::Origin::Tray,
+        &tracking::local_hostname(),
+    );
+    let script = launcher::build_script(adapter.kind, &cd, &pp, &tracking_env);
     let script_path = launcher::write_script(&script, adapter.kind).map_err(|e| e.to_string())?;
 
     adapters::spawn(&adapter, &script_path.to_string_lossy(), &pp).map_err(|e| {
-        let _ = app.clipboard().write_text(manual_command(&cd, &pp));
+        let _ = app.clipboard().write_text(launcher::manual_command(adapter.kind, &cd, &pp));
         format!(
             "Couldn't open terminal '{}' ({e}). The launch command was copied to your clipboard — paste it into any terminal.",
             adapter.id
         )
     })
+}
+
+/// Tray "Open in Orca": opens an Orca terminal running `cms <account>` in the
+/// worktree matching the project's path. Blocking (the Orca handshake can take
+/// a while), so callers run it off the main thread. Not a `#[tauri::command]`.
+#[cfg(target_os = "macos")]
+pub fn open_in_orca(app: &AppHandle, account_id: &str, project_id: &str) -> Result<(), String> {
+    use crate::orca::{open, source};
+    let cfg = load_config(app)?;
+    let account = cfg.account(account_id).ok_or("unknown account")?;
+    let project = cfg.project(project_id).ok_or("unknown project")?;
+
+    let project_path = expand_tilde(&project.path);
+    validate_project_dir(&project.label, &project_path)?;
+    session::ensure_session_usable(account)?;
+
+    let cli = std::path::Path::new(source::CLI_PATH);
+    if !cli.is_file() {
+        return Err("Orca isn't installed.".into());
+    }
+    let cms = crate::cms_path::resolve();
+    let args = open::build_open_in_orca_args(
+        &project_path.to_string_lossy(),
+        cms.as_deref().and_then(|p| p.to_str()),
+        &account.id,
+    );
+    open::open_in_orca(cli, &args, &open::OpenTimings::default())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_orca(_app: &AppHandle, _account_id: &str, _project_id: &str) -> Result<(), String> {
+    Err("Open in Orca is only available on macOS.".into())
 }
 
 /// A project-less action performed under one account's `CLAUDE_CONFIG_DIR`.
@@ -197,7 +421,7 @@ fn run_account_action(
     account_id: &str,
     action: AccountAction,
 ) -> Result<(), String> {
-    let cfg = Config::load(&paths::config_file_path(app));
+    let cfg = load_config(app)?;
     let account = cfg.account(account_id).ok_or("unknown account")?;
     let adapter = adapters::find_adapter(&cfg.terminal).ok_or("unknown terminal")?;
 
@@ -230,25 +454,32 @@ fn run_account_action(
         ensure_account_inherits(app, account_id)?;
     }
 
+    // Only sessions report; secrets stay out of the clipboard fallbacks.
+    let tracking_env = tracking::tracking_env(
+        &cfg.tracking,
+        &account.id,
+        tracking::Origin::Tray,
+        &tracking::local_hostname(),
+    );
     let (script, fallback, what) = match action {
         AccountAction::Login => (
-            launcher::build_login_script(adapter.kind, &cd),
-            manual_login_command(&cd),
+            launcher::build_login_script(adapter.kind, &cd, &tracking_env),
+            launcher::manual_login_command(adapter.kind, &cd),
             "login",
         ),
         AccountAction::Session => (
-            launcher::build_login_script(adapter.kind, &cd),
-            manual_login_command(&cd),
+            launcher::build_login_script(adapter.kind, &cd, &tracking_env),
+            launcher::manual_login_command(adapter.kind, &cd),
             "the session",
         ),
         AccountAction::Logout => (
             launcher::build_logout_script(adapter.kind, &cd),
-            manual_logout_command(&cd),
+            launcher::manual_logout_command(adapter.kind, &cd),
             "logout",
         ),
         AccountAction::Relogin => (
             launcher::build_relogin_script(adapter.kind, &cd),
-            manual_relogin_command(&cd),
+            launcher::manual_relogin_command(adapter.kind, &cd),
             "re-login",
         ),
     };
@@ -283,6 +514,138 @@ pub fn relogin_account(app: AppHandle, account_id: String) -> Result<(), String>
     run_account_action(&app, &account_id, AccountAction::Relogin)
 }
 
+/// Login status + rolling usage for every account, for the Preferences
+/// Accounts card (the tray menu may be unreachable). Read-only: never creates a
+/// config dir and never opens a terminal. Keychain reads and log scans run on a
+/// blocking thread so the UI thread never stalls.
+#[tauri::command]
+pub async fn accounts_overview(
+    app: AppHandle,
+    refresh: Option<bool>,
+) -> Result<Vec<AccountOverview>, String> {
+    // Lock-free config read; the probes below can take a while.
+    let cfg = load_config(&app)?;
+    let force = refresh.unwrap_or(false);
+    let endpoint_on = cfg.usage.endpoint_enabled;
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let now = chrono::Utc::now();
+        let session_since = usage::session_window_start(now);
+        let week_since = usage::week_window_start(now);
+        let app_data = crate::paths::app_data_dir();
+
+        // Phase 1: local, per-account data (sequential, no network).
+        struct Local {
+            dir: std::path::PathBuf,
+            status: session::SessionStatus,
+            probed: bool,
+            windows: Vec<usage::UsageSummary>,
+            record: Option<crate::statusline::UsageRecord>,
+            oauth: Option<crate::config::OauthAccount>,
+        }
+        let locals: Vec<Local> = cfg
+            .accounts
+            .iter()
+            .map(|account| {
+                let dir = expand_tilde(&account.config_dir);
+                if !dir.is_dir() {
+                    // Nothing to probe: skip the Keychain and the log scan.
+                    return Local {
+                        dir,
+                        status: session::SessionStatus::LoggedOut { last_email: None },
+                        probed: false,
+                        windows: vec![usage::UsageSummary::default(); 2],
+                        record: None,
+                        oauth: None,
+                    };
+                }
+                let status = session::account_session_status(account);
+                let windows = usage::account_usage(account, &[session_since, week_since]);
+                // The recorder hashes the EXPANDED dir it was launched with.
+                let record = app_data
+                    .as_deref()
+                    .and_then(|d| crate::statusline::read_usage_record(d, &dir.to_string_lossy()));
+                let oauth = crate::config::read_oauth_account(&dir);
+                Local {
+                    dir,
+                    status,
+                    probed: true,
+                    windows,
+                    record,
+                    oauth,
+                }
+            })
+            .collect();
+
+        // Phase 2: opt-in endpoint, concurrent across accounts with an overall
+        // deadline (shares Claude Code's rate limits; only for a usable login;
+        // the cache enforces TTL/backoff). Accounts that miss the deadline fall
+        // back to statusline/estimate for this call.
+        let jobs: Vec<Option<(std::path::PathBuf, bool)>> = locals
+            .iter()
+            .map(|l| {
+                (endpoint_on
+                    && l.probed
+                    && matches!(l.status, session::SessionStatus::LoggedIn { .. }))
+                .then(|| {
+                    let has_tier = l.oauth.as_ref().is_some_and(|o| {
+                        o.rate_tier
+                            .as_deref()
+                            .and_then(overview::tier_label)
+                            .or_else(|| o.org_type.as_deref().and_then(overview::tier_label))
+                            .is_some()
+                    });
+                    (l.dir.clone(), !has_tier)
+                })
+            })
+            .collect();
+        let transport = std::sync::Arc::new(crate::usage_endpoint::UreqTransport::default());
+        let now_ts = now.timestamp();
+        let work_handle = handle.clone();
+        let readings = crate::usage_endpoint::run_concurrent(
+            jobs,
+            crate::usage_endpoint::FETCH_DEADLINE,
+            std::sync::Arc::new(move |job: Option<(std::path::PathBuf, bool)>| {
+                let (dir, need_profile) = job?;
+                let cache = work_handle.state::<crate::usage_endpoint::EndpointCache>();
+                crate::usage_endpoint::fetch_account(
+                    &cache,
+                    &crate::usage_endpoint::FetchRequest {
+                        enabled: true,
+                        dir: &dir,
+                        now: now_ts,
+                        force,
+                        need_profile,
+                    },
+                    &session::read_access_token,
+                    transport.as_ref(),
+                )
+            }),
+        );
+
+        cfg.accounts
+            .iter()
+            .zip(locals.iter())
+            .zip(readings)
+            .map(|((account, l), endpoint)| {
+                let endpoint = endpoint.flatten();
+                let inputs = overview::UsageInputs {
+                    record: l.record.as_ref(),
+                    session_estimate: &l.windows[0],
+                    week_estimate: &l.windows[1],
+                    oauth: l.oauth.as_ref(),
+                    endpoint: endpoint.as_ref(),
+                    now: now_ts,
+                };
+                overview::build_overview(account, &l.status, l.probed, &inputs)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Read-only inheritance status for one account, one row per inheritable subdir.
 /// Lists `~/.claude` and the account dir; never writes. Returns all-`none` rows
 /// when `~/.claude` is absent.
@@ -291,7 +654,7 @@ pub fn get_inherit_status(
     app: AppHandle,
     account_id: String,
 ) -> Result<Vec<inherit::InheritSubdirStatus>, String> {
-    let cfg = Config::load(&paths::config_file_path(&app));
+    let cfg = load_config(&app)?;
     let account = cfg.account(&account_id).ok_or("unknown account")?;
     let config_dir = expand_tilde(&account.config_dir);
     let source = expand_tilde("~/.claude");
@@ -313,63 +676,21 @@ pub fn set_inherit_decision(
         return Err(format!("unknown subdir: {subdir}"));
     }
     let source = expand_tilde("~/.claude");
-    let cfg_path = paths::config_file_path(&app);
-    let mut cfg = Config::load(&cfg_path);
-    let config_dir = expand_tilde(
-        &cfg.account(&account_id)
+    let new = HashMap::from([(subdir, decision)]);
+    let (config_dir, decisions) = app.state::<ConfigStore>().update(|c| {
+        let decisions = apply_inherit_decisions(c, &account_id, &new)?;
+        let dir = c
+            .account(&account_id)
             .ok_or("unknown account")?
-            .config_dir,
-    );
-
-    let account = cfg
-        .accounts
-        .iter_mut()
-        .find(|a| a.id == account_id)
-        .ok_or("unknown account")?;
-    account.inherit_overrides.insert(subdir, decision);
-    let decisions = account.inherit_overrides.clone();
-    cfg.save(&cfg_path).map_err(|e| e.to_string())?;
+            .config_dir
+            .clone();
+        Ok((expand_tilde(&dir), decisions))
+    })?;
 
     if source.is_dir() {
         inherit::ensure_inherited(&source, &config_dir, &decisions).map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod fallback_tests {
-    use super::{
-        manual_command, manual_login_command, manual_logout_command, manual_relogin_command,
-    };
-    #[test]
-    fn test_should_build_manual_command_when_spawn_fails() {
-        let cmd = manual_command("/home/u/.claude-dino", "/repo");
-        assert_eq!(
-            cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"cd '/repo' && exec claude\""
-        );
-    }
-    #[test]
-    fn test_should_build_manual_login_command_when_spawn_fails() {
-        let cmd = manual_login_command("/home/u/.claude-dino");
-        assert_eq!(
-            cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"exec claude\""
-        );
-    }
-    #[test]
-    fn test_should_build_manual_logout_command_when_spawn_fails() {
-        let cmd = manual_logout_command("/home/u/.claude-dino");
-        assert_eq!(
-            cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"claude auth logout\""
-        );
-    }
-    #[test]
-    fn test_should_build_manual_relogin_command_when_spawn_fails() {
-        let cmd = manual_relogin_command("/home/u/.claude-dino");
-        assert_eq!(cmd, "CLAUDE_CONFIG_DIR='/home/u/.claude-dino' sh -c \"claude auth logout; claude auth login\"");
-    }
 }
 
 #[cfg(test)]
@@ -417,7 +738,7 @@ mod launch_tests {
 
     #[test]
     fn test_should_build_session_script_from_account_and_project_dirs() {
-        let s = build_script(ScriptKind::Posix, "/home/u/.claude-dino", "/repo");
+        let s = build_script(ScriptKind::Posix, "/home/u/.claude-dino", "/repo", &[]);
         assert!(s.contains("CLAUDE_CONFIG_DIR='/home/u/.claude-dino'"));
         assert!(s.contains("cd '/repo'"));
     }

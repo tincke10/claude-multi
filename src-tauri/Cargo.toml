@@ -5,6 +5,9 @@ description = "Cross-OS system-tray app to run Claude Code under multiple isolat
 authors = ["Lucas Donadio"]
 license = "MIT"
 edition = "2021"
+# Two binaries: without this, `cargo run` (and so `npm run tauri dev`) can't
+# pick one and fails. It also pins the Tauri bundler to the app binary.
+default-run = "claude-multi"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -33,7 +36,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tauri-plugin-clipboard-manager = "2.3.2"
 tempfile = "3.27.0"
 tauri-plugin-dialog = "2.7.1"
@@ -41,4 +44,13 @@ tauri-plugin-single-instance = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 sha2 = "0.10"
 dirs = "6"
+base64 = "0.22"
+gethostname = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
