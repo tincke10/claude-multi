@@ -52,13 +52,13 @@ pub(crate) const PROFILE_INDEX: &str = r#"{"schemaVersion":1,"activeProfileId":"
 
 /// A fake `orca` CLI: a temp `#!/bin/sh` script next to the JSON files it
 /// prints. Every invocation's argv is appended to `calls.log`.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 pub(crate) struct FakeCli {
     pub dir: tempfile::TempDir,
     pub path: std::path::PathBuf,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 impl FakeCli {
     /// The standard script: `status`, `repo list` and `worktree list` print
     /// `status.json`, `repos.json` and `worktrees.json` (or
@@ -111,7 +111,7 @@ esac"#,
 }
 
 /// Writes `orca-profile-index.json` (synthetic) into `data_dir`.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 pub(crate) fn write_profile_index(data_dir: &std::path::Path, active: &str, ids: &[&str]) {
     std::fs::create_dir_all(data_dir).unwrap();
     let profiles: Vec<_> = ids

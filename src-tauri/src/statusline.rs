@@ -521,6 +521,7 @@ mod tests {
         std::fs::write(dir.join(SIDECAR_FILE), body.to_string()).unwrap();
     }
 
+    #[cfg(unix)]
     fn cmd_original(command: &str) -> serde_json::Value {
         serde_json::json!({"type":"command","command":command,"padding":0})
     }

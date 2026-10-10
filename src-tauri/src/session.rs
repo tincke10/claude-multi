@@ -146,6 +146,7 @@ fn read_keychain_credentials(_config_dir: &Path) -> CredentialSource {
 
 /// How long a Keychain read may take before it counts as unreadable (a prompt
 /// nobody answers must not freeze the overview).
+#[cfg(target_os = "macos")]
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const KEYCHAIN_OUT_CAP: usize = 64 * 1024;
 
