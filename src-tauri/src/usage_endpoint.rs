@@ -411,6 +411,44 @@ pub fn fetch_account(
     Some(reading_from(&entry))
 }
 
+/// Overall budget for the endpoint fetches of one overview call.
+pub const FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Runs `work` for every job on its own thread and collects the results that
+/// arrive before `deadline` (measured from the call). Unfinished jobs yield
+/// `None`; their threads are left to finish detached (they only write to the
+/// shared cache, so a late result still benefits the next call).
+pub fn run_concurrent<J, R>(
+    jobs: Vec<J>,
+    deadline: std::time::Duration,
+    work: std::sync::Arc<dyn Fn(J) -> R + Send + Sync>,
+) -> Vec<Option<R>>
+where
+    J: Send + 'static,
+    R: Send + 'static,
+{
+    let start = std::time::Instant::now();
+    let total = jobs.len();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, R)>();
+    for (i, job) in jobs.into_iter().enumerate() {
+        let tx = tx.clone();
+        let work = std::sync::Arc::clone(&work);
+        std::thread::spawn(move || {
+            let _ = tx.send((i, work(job)));
+        });
+    }
+    drop(tx);
+    let mut out: Vec<Option<R>> = (0..total).map(|_| None).collect();
+    for _ in 0..total {
+        let left = deadline.saturating_sub(start.elapsed());
+        match rx.recv_timeout(left) {
+            Ok((i, r)) => out[i] = Some(r),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +467,42 @@ mod tests {
 
     fn token() -> Result<AccessToken, TokenError> {
         Ok(AccessToken::new(SECRET.to_string()))
+    }
+
+    // ---- run_concurrent -------------------------------------------------
+
+    #[test]
+    fn test_should_run_jobs_concurrently_when_each_is_slow() {
+        let start = std::time::Instant::now();
+        let out = run_concurrent(
+            vec![1u32, 2, 3],
+            std::time::Duration::from_secs(5),
+            Arc::new(|n: u32| {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                n * 10
+            }),
+        );
+        assert_eq!(out, vec![Some(10), Some(20), Some(30)]);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(1000),
+            "sequential would take 1200ms, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_should_return_none_for_unfinished_jobs_when_the_deadline_passes() {
+        let start = std::time::Instant::now();
+        let out = run_concurrent(
+            vec![0u64, 3000, 3000],
+            std::time::Duration::from_millis(300),
+            Arc::new(|ms: u64| {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                ms
+            }),
+        );
+        assert_eq!(out, vec![Some(0), None, None]);
+        assert!(start.elapsed() < std::time::Duration::from_millis(1500));
     }
 
     // ---- parse_usage ----------------------------------------------------

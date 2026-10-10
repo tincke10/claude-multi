@@ -530,29 +530,35 @@ pub async fn accounts_overview(
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         use tauri::Manager;
-        let cache = handle.state::<crate::usage_endpoint::EndpointCache>();
-        let transport = crate::usage_endpoint::UreqTransport::default();
         let now = chrono::Utc::now();
         let session_since = usage::session_window_start(now);
         let week_since = usage::week_window_start(now);
         let app_data = crate::paths::app_data_dir();
-        cfg.accounts
+
+        // Phase 1: local, per-account data (sequential, no network).
+        struct Local {
+            dir: std::path::PathBuf,
+            status: session::SessionStatus,
+            probed: bool,
+            windows: Vec<usage::UsageSummary>,
+            record: Option<crate::statusline::UsageRecord>,
+            oauth: Option<crate::config::OauthAccount>,
+        }
+        let locals: Vec<Local> = cfg
+            .accounts
             .iter()
             .map(|account| {
                 let dir = expand_tilde(&account.config_dir);
-                let empty = usage::UsageSummary::default();
                 if !dir.is_dir() {
                     // Nothing to probe: skip the Keychain and the log scan.
-                    let none = session::SessionStatus::LoggedOut { last_email: None };
-                    let inputs = overview::UsageInputs {
+                    return Local {
+                        dir,
+                        status: session::SessionStatus::LoggedOut { last_email: None },
+                        probed: false,
+                        windows: vec![usage::UsageSummary::default(); 2],
                         record: None,
-                        session_estimate: &empty,
-                        week_estimate: &empty,
                         oauth: None,
-                        endpoint: None,
-                        now: now.timestamp(),
                     };
-                    return overview::build_overview(account, &none, false, &inputs);
                 }
                 let status = session::account_session_status(account);
                 let windows = usage::account_usage(account, &[session_since, week_since]);
@@ -561,40 +567,78 @@ pub async fn accounts_overview(
                     .as_deref()
                     .and_then(|d| crate::statusline::read_usage_record(d, &dir.to_string_lossy()));
                 let oauth = crate::config::read_oauth_account(&dir);
-                // Opt-in, sequential across accounts (shares Claude Code's rate
-                // limits), only for a usable login; the cache enforces TTL/backoff.
-                let endpoint = matches!(status, session::SessionStatus::LoggedIn { .. })
-                    .then(|| {
-                        let has_tier = oauth.as_ref().is_some_and(|o| {
-                            o.rate_tier
-                                .as_deref()
-                                .and_then(overview::tier_label)
-                                .or_else(|| o.org_type.as_deref().and_then(overview::tier_label))
-                                .is_some()
-                        });
-                        crate::usage_endpoint::fetch_account(
-                            &cache,
-                            &crate::usage_endpoint::FetchRequest {
-                                enabled: endpoint_on,
-                                dir: &dir,
-                                now: now.timestamp(),
-                                force,
-                                need_profile: !has_tier,
-                            },
-                            &session::read_access_token,
-                            &transport,
-                        )
-                    })
-                    .flatten();
+                Local {
+                    dir,
+                    status,
+                    probed: true,
+                    windows,
+                    record,
+                    oauth,
+                }
+            })
+            .collect();
+
+        // Phase 2: opt-in endpoint, concurrent across accounts with an overall
+        // deadline (shares Claude Code's rate limits; only for a usable login;
+        // the cache enforces TTL/backoff). Accounts that miss the deadline fall
+        // back to statusline/estimate for this call.
+        let jobs: Vec<Option<(std::path::PathBuf, bool)>> = locals
+            .iter()
+            .map(|l| {
+                (endpoint_on
+                    && l.probed
+                    && matches!(l.status, session::SessionStatus::LoggedIn { .. }))
+                .then(|| {
+                    let has_tier = l.oauth.as_ref().is_some_and(|o| {
+                        o.rate_tier
+                            .as_deref()
+                            .and_then(overview::tier_label)
+                            .or_else(|| o.org_type.as_deref().and_then(overview::tier_label))
+                            .is_some()
+                    });
+                    (l.dir.clone(), !has_tier)
+                })
+            })
+            .collect();
+        let transport = std::sync::Arc::new(crate::usage_endpoint::UreqTransport::default());
+        let now_ts = now.timestamp();
+        let work_handle = handle.clone();
+        let readings = crate::usage_endpoint::run_concurrent(
+            jobs,
+            crate::usage_endpoint::FETCH_DEADLINE,
+            std::sync::Arc::new(move |job: Option<(std::path::PathBuf, bool)>| {
+                let (dir, need_profile) = job?;
+                let cache = work_handle.state::<crate::usage_endpoint::EndpointCache>();
+                crate::usage_endpoint::fetch_account(
+                    &cache,
+                    &crate::usage_endpoint::FetchRequest {
+                        enabled: true,
+                        dir: &dir,
+                        now: now_ts,
+                        force,
+                        need_profile,
+                    },
+                    &session::read_access_token,
+                    transport.as_ref(),
+                )
+            }),
+        );
+
+        cfg.accounts
+            .iter()
+            .zip(locals.iter())
+            .zip(readings)
+            .map(|((account, l), endpoint)| {
+                let endpoint = endpoint.flatten();
                 let inputs = overview::UsageInputs {
-                    record: record.as_ref(),
-                    session_estimate: &windows[0],
-                    week_estimate: &windows[1],
-                    oauth: oauth.as_ref(),
+                    record: l.record.as_ref(),
+                    session_estimate: &l.windows[0],
+                    week_estimate: &l.windows[1],
+                    oauth: l.oauth.as_ref(),
                     endpoint: endpoint.as_ref(),
-                    now: now.timestamp(),
+                    now: now_ts,
                 };
-                overview::build_overview(account, &status, true, &inputs)
+                overview::build_overview(account, &l.status, l.probed, &inputs)
             })
             .collect()
     })
