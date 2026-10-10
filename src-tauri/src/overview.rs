@@ -494,6 +494,15 @@ mod tests {
                 points: 60
             }
         );
+        // Reset a whole window ago -> elapsed would be 200%: it must still be
+        // clamped to 100%, so the gap stays 60 points (not 160).
+        assert_eq!(
+            pacing(40.0, NOW - SESSION_WINDOW_SECS, SESSION_WINDOW_SECS, NOW),
+            Some(Pacing {
+                kind: PacingKind::Under,
+                points: 60
+            })
+        );
         // Reset farther than a whole window -> elapsed < 0 -> clamped to 0 -> hidden.
         assert_eq!(
             pacing(
