@@ -1,11 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Account, Config, Project, TerminalInfo, InheritSubdirStatus, InheritDecision, UsageLimits,
-  TrackingConfig, TrackingCheck,
+  TrackingConfig, TrackingCheck, AccountOverview, UsageView,
   getConfig, saveConfig, listTerminals, getInheritStatus, setInheritDecision, testTrackingConnection,
+  accountsOverview, loginAccount, logoutAccount, reloginAccount,
 } from "./api";
+import {
+  AuthAction, ACTION_LABEL, POLL_DELAYS_MS, actionsFor, isSaved, statusPill, usageText,
+} from "./accounts";
 import OrcaPanel from "./OrcaPanel";
 import { appendImported } from "./orca";
 import { trackingProblem } from "./tracking";
@@ -52,6 +56,70 @@ function updateAt<T>(arr: T[], i: number, patch: Partial<T>): T[] {
   return arr.map((item, j) => (j === i ? { ...item, ...patch } : item));
 }
 
+const AUTH_CALLS: Record<AuthAction, (id: string) => Promise<void>> = {
+  login: loginAccount,
+  logout: logoutAccount,
+  relogin: reloginAccount,
+};
+
+// Same key the poller compares: a login/logout/relogin changes status or email.
+const overviewKey = (o: AccountOverview | undefined) => (o ? `${o.status}|${o.email ?? ""}` : "");
+
+function UsageBar({ name, u }: { name: string; u: UsageView }) {
+  return (
+    <div className="usage">
+      <span className="usage__name">{name}</span>
+      <span className="usage__track" aria-hidden="true">
+        {u.percent !== null && (
+          <span
+            className={`usage__fill ${u.percent >= 90 ? "usage__fill--hot" : ""}`}
+            style={{ width: `${u.percent}%` }}
+          />
+        )}
+      </span>
+      <span className="usage__text">{usageText(u)}</span>
+    </div>
+  );
+}
+
+function AccountStatusRow(props: {
+  overview: AccountOverview | undefined;
+  saved: boolean;
+  loaded: boolean;
+  busy: boolean;
+  error: string | undefined;
+  onAction: (a: AuthAction) => void;
+}) {
+  const { overview: o, saved, loaded, busy, error, onAction } = props;
+  if (!saved || !o) {
+    return (
+      <div className="row account__status">
+        <span className="muted">{loaded ? "Save first to log in and see usage." : "Checking…"}</span>
+      </div>
+    );
+  }
+  const pill = statusPill(o);
+  return (
+    <>
+      <div className="row account__status">
+        <span className={`pill pill--${pill.tone}`}>{pill.text}</span>
+        <span className="row__grow" />
+        {actionsFor(o.status).map((act) => (
+          <button
+            key={act}
+            className="btn btn--secondary btn--compact"
+            disabled={busy}
+            onClick={() => onAction(act)}
+          >{ACTION_LABEL[act]}</button>
+        ))}
+      </div>
+      {error && <p className="field-error">{error}</p>}
+      <UsageBar name="Session (5h)" u={o.session} />
+      <UsageBar name="Week (7d)" u={o.week} />
+    </>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
@@ -68,6 +136,89 @@ export default function App() {
   const [checkErr, setCheckErr] = useState<string | null>(null);
   // Raw worktree-roots text per project id (see `setRoots`).
   const [rootsDrafts, setRootsDrafts] = useState<Record<string, string>>({});
+
+  // Accounts card: login status + usage, refreshed on mount, Save, focus and
+  // (polled) after an auth action, since logins finish in an external terminal.
+  const [overview, setOverview] = useState<AccountOverview[]>([]);
+  const [overviewLoaded, setOverviewLoaded] = useState(false);
+  const [overviewErr, setOverviewErr] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [actionErrs, setActionErrs] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<Set<string>>(new Set());
+  const mounted = useRef(true);
+  const overviewRef = useRef<AccountOverview[]>([]);
+  const pollTimers = useRef<Map<string, number>>(new Map());
+
+  const refreshOverview = async (): Promise<AccountOverview[] | null> => {
+    setRefreshing(true);
+    try {
+      const rows = await accountsOverview();
+      if (!mounted.current) return null;
+      overviewRef.current = rows;
+      setOverview(rows);
+      setOverviewLoaded(true);
+      setOverviewErr(null);
+      return rows;
+    } catch (e) {
+      if (mounted.current) setOverviewErr(`${e}`);
+      return null;
+    } finally {
+      if (mounted.current) setRefreshing(false);
+    }
+  };
+
+  const stopPolling = (id: string) => {
+    const t = pollTimers.current.get(id);
+    if (t !== undefined) window.clearTimeout(t);
+    pollTimers.current.delete(id);
+  };
+
+  // Re-read the overview with growing delays (~2 min) until this account's
+  // status/email differs from `prevKey`, then stop.
+  const startPolling = (id: string, prevKey: string) => {
+    stopPolling(id);
+    let step = 0;
+    const schedule = () => {
+      if (step >= POLL_DELAYS_MS.length) { pollTimers.current.delete(id); return; }
+      pollTimers.current.set(id, window.setTimeout(tick, POLL_DELAYS_MS[step++]));
+    };
+    const tick = async () => {
+      const rows = await refreshOverview();
+      if (!mounted.current) return;
+      if (overviewKey(rows?.find((r) => r.id === id)) !== prevKey && rows !== null) {
+        pollTimers.current.delete(id);
+        return;
+      }
+      schedule();
+    };
+    schedule();
+  };
+
+  const runAuthAction = async (id: string, action: AuthAction) => {
+    const prevKey = overviewKey(overviewRef.current.find((r) => r.id === id));
+    setBusy((b) => new Set(b).add(id));
+    setActionErrs((m) => { const { [id]: _drop, ...rest } = m; return rest; });
+    try {
+      await AUTH_CALLS[action](id);
+      startPolling(id, prevKey);
+    } catch (e) {
+      setActionErrs((m) => ({ ...m, [id]: `${e}` }));
+    } finally {
+      setBusy((b) => { const n = new Set(b); n.delete(id); return n; });
+    }
+  };
+
+  useEffect(() => {
+    mounted.current = true;
+    const timers = pollTimers.current;
+    if (IN_TAURI) void refreshOverview();
+    return () => {
+      mounted.current = false;
+      timers.forEach((t) => window.clearTimeout(t));
+      timers.clear();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!IN_TAURI) {
@@ -122,7 +273,7 @@ export default function App() {
     if (!IN_TAURI) return;
     let unlisten: (() => void) | undefined;
     getCurrentWindow()
-      .onFocusChanged(({ payload: focused }) => { if (focused) { setStatus(null); setSaveWarnings([]); } })
+      .onFocusChanged(({ payload: focused }) => { if (focused) { setStatus(null); setSaveWarnings([]); void refreshOverview(); } })
       .then((u) => { unlisten = u; });
     return () => unlisten?.();
   }, []);
@@ -236,6 +387,7 @@ export default function App() {
     try {
       const warnings = await saveConfig(cfg);
       setSaveWarnings(warnings);
+      void refreshOverview();
       // Re-fetch tracking so freshly typed tokens go back to the mask: the
       // plain value must not linger in UI state after it is stored.
       const fresh = await getConfig();
@@ -274,7 +426,16 @@ export default function App() {
       <section className="card">
         <div className="card__head">
           <h2 className="card__title">Accounts</h2>
-          <button className="btn btn--ghost" onClick={addAccount}>+ Add account</button>
+          <div className="card__actions">
+            <button
+              className="btn btn--icon btn--refresh"
+              title="Refresh login status and usage"
+              aria-label="Refresh login status and usage"
+              onClick={() => void refreshOverview()}
+              disabled={refreshing}
+            >↻</button>
+            <button className="btn btn--ghost" onClick={addAccount}>+ Add account</button>
+          </div>
         </div>
         <p className="card__hint">
           Each account is isolated in its own <code>{CLAUDE_DIR_PREFIX}…</code> config directory.
@@ -286,6 +447,7 @@ export default function App() {
           blank to show raw tokens.
         </p>
 
+        {overviewErr && <p className="field-error">Couldn't read account status: {overviewErr}</p>}
         {cfg.accounts.length === 0 && <p className="muted">No accounts yet.</p>}
         {cfg.accounts.map((a, i) => (
           <div className="account" key={a.id}>
@@ -318,6 +480,14 @@ export default function App() {
                 Another account already uses <code>{a.config_dir}</code>. Each account needs its own config directory.
               </p>
             )}
+            <AccountStatusRow
+              overview={overview.find((o) => o.id === a.id)}
+              saved={isSaved(overview.find((o) => o.id === a.id), a.id, a.config_dir)}
+              loaded={overviewLoaded}
+              busy={busy.has(a.id)}
+              error={actionErrs[a.id]}
+              onAction={(act) => void runAuthAction(a.id, act)}
+            />
             <div className="row account__limits">
               <label className="field">
                 <span className="field__label">Session (5h) ceiling</span>

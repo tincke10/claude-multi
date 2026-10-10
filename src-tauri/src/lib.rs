@@ -8,6 +8,7 @@ pub mod hooks_install;
 pub mod inherit;
 pub mod launcher;
 pub mod orca;
+pub mod overview;
 pub mod paths;
 pub mod session;
 pub mod summary;
@@ -40,6 +41,7 @@ pub fn run() {
             commands::login_account,
             commands::logout_account,
             commands::relogin_account,
+            commands::accounts_overview,
             commands::get_inherit_status,
             commands::set_inherit_decision,
         ])
