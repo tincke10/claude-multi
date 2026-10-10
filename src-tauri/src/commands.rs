@@ -199,6 +199,93 @@ pub async fn test_tracking_connection(
     .map_err(|e| e.to_string())
 }
 
+/// Orca integration health for the Preferences panel. Read-only; runs on a
+/// blocking thread (login-shell probe + Orca CLI). Off macOS the whole
+/// integration is hidden (`supported: false`).
+#[tauri::command]
+pub async fn orca_health(app: AppHandle) -> Result<crate::orca::health::OrcaHealth, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Lock-free read: never hold the config lock across the probes.
+        let cfg = load_config(&app)?;
+        tauri::async_runtime::spawn_blocking(move || crate::orca::probe::health_system(&cfg))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(crate::orca::health::OrcaHealth {
+            supported: false,
+            checks: Vec::new(),
+        })
+    }
+}
+
+/// Import dialog data: Orca repos not yet covered by a project. Read-only.
+#[tauri::command]
+pub async fn list_orca_import_candidates(
+    app: AppHandle,
+) -> Result<crate::orca::import::ImportList, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Lock-free config read; the Orca CLI call below can take seconds.
+        let cfg = load_config(&app)?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let home = dirs::home_dir().ok_or("no home directory")?;
+            let paths = crate::orca::source::OrcaPaths::system(&home);
+            crate::orca::import::list_candidates(&cfg, &home, &|| {
+                crate::orca::source::read_snapshot(&paths)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err(ORCA_MACOS_ONLY.to_string())
+    }
+}
+
+/// Imports the chosen Orca repos as projects. Returns the added projects so
+/// the open Preferences window can append them to its local state (a reload
+/// would drop its unsaved edits). Orca is read before, and duplicates are
+/// re-checked inside, the config lock.
+#[tauri::command]
+pub async fn import_orca_repos(
+    app: AppHandle,
+    selections: Vec<crate::orca::plan::ImportSelection>,
+) -> Result<Vec<crate::config::Project>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let handle = app.clone();
+        let added = tauri::async_runtime::spawn_blocking(move || {
+            let home = dirs::home_dir().ok_or("no home directory")?;
+            let paths = crate::orca::source::OrcaPaths::system(&home);
+            crate::orca::import::import_repos(
+                &handle.state::<ConfigStore>(),
+                &home,
+                &selections,
+                &|| crate::orca::source::read_snapshot(&paths),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        // After the lock is released, like `save_config`.
+        let _ = crate::tray::refresh_tray(&app);
+        Ok(added)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, selections);
+        Err(ORCA_MACOS_ONLY.to_string())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+const ORCA_MACOS_ONLY: &str = "The Orca integration is only available on macOS.";
+
 #[tauri::command]
 pub fn list_terminals() -> Vec<TerminalInfo> {
     adapters::builtin_adapters()
@@ -249,6 +336,38 @@ pub fn launch_session(
             adapter.id
         )
     })
+}
+
+/// Tray "Open in Orca": opens an Orca terminal running `cms <account>` in the
+/// worktree matching the project's path. Blocking (the Orca handshake can take
+/// a while), so callers run it off the main thread. Not a `#[tauri::command]`.
+#[cfg(target_os = "macos")]
+pub fn open_in_orca(app: &AppHandle, account_id: &str, project_id: &str) -> Result<(), String> {
+    use crate::orca::{open, source};
+    let cfg = load_config(app)?;
+    let account = cfg.account(account_id).ok_or("unknown account")?;
+    let project = cfg.project(project_id).ok_or("unknown project")?;
+
+    let project_path = expand_tilde(&project.path);
+    validate_project_dir(&project.label, &project_path)?;
+    session::ensure_session_usable(account)?;
+
+    let cli = std::path::Path::new(source::CLI_PATH);
+    if !cli.is_file() {
+        return Err("Orca isn't installed.".into());
+    }
+    let cms = crate::cms_path::resolve();
+    let args = open::build_open_in_orca_args(
+        &project_path.to_string_lossy(),
+        cms.as_deref().and_then(|p| p.to_str()),
+        &account.id,
+    );
+    open::open_in_orca(cli, &args, &open::OpenTimings::default())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_orca(_app: &AppHandle, _account_id: &str, _project_id: &str) -> Result<(), String> {
+    Err("Open in Orca is only available on macOS.".into())
 }
 
 /// A project-less action performed under one account's `CLAUDE_CONFIG_DIR`.

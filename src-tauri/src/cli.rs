@@ -14,6 +14,9 @@ pub enum CliCommand {
         explicit: bool,
     },
     List,
+    /// `cms --version` / `-V`: print the version. Wins over any extra args and
+    /// never reads the config.
+    Version,
     Launch {
         query: String,
         claude_args: Vec<String>,
@@ -145,7 +148,7 @@ impl std::error::Error for AutoResolveError {}
 
 /// Lexical normalization: drops `.`, folds `..` against the previous normal
 /// component, ignores trailing separators (components never yield them).
-fn normalize_lexical(p: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
@@ -248,6 +251,7 @@ pub fn resolve_account_for_cwd<'a>(
 pub fn parse_cli_args(args: &[String]) -> CliCommand {
     match args.first().map(String::as_str) {
         None => CliCommand::Help { explicit: false },
+        Some("--version") | Some("-V") => CliCommand::Version,
         Some("--help") | Some("-h") if args.len() == 1 => CliCommand::Help { explicit: true },
         Some("--list") | Some("-l") if args.len() == 1 => CliCommand::List,
         Some("--hook") if args.len() == 2 => match args[1].as_str() {
@@ -328,6 +332,24 @@ mod tests {
         assert_eq!(
             parse_cli_args(&args(&["-h"])),
             CliCommand::Help { explicit: true }
+        );
+    }
+
+    #[test]
+    fn test_should_return_version_when_args_are_version_flag() {
+        assert_eq!(parse_cli_args(&args(&["--version"])), CliCommand::Version);
+        assert_eq!(parse_cli_args(&args(&["-V"])), CliCommand::Version);
+    }
+
+    #[test]
+    fn test_should_prefer_version_when_extra_args_present() {
+        assert_eq!(
+            parse_cli_args(&args(&["--version", "--list"])),
+            CliCommand::Version
+        );
+        assert_eq!(
+            parse_cli_args(&args(&["-V", "work", "--x"])),
+            CliCommand::Version
         );
     }
 

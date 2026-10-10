@@ -8,6 +8,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Orca integration (macOS, read-only)**: Preferences gets an Orca panel with a
+  **health check** (cms on the login PATH and same version as the app, Orca's
+  agent command override, managed-account conflicts, unmapped repos), **Import
+  from Orca...** (pick repos, choose an account, worktree roots derived
+  automatically) and a tray **Open in Orca** submenu per project that opens an
+  Orca terminal running `cms <account>`. Orca is read through its CLI, with a
+  private snapshot copy of its SQLite profile as fallback; claude-multi never
+  writes Orca's files. Hidden when Orca is not installed. Adds a bundled SQLite
+  (`rusqlite`), about 1 MB on macOS builds only.
+- **`cms --version`** prints `cms <version>`.
 - **`cms --auto [claude args...]`**: picks the account from the working
   directory (project path or the new per-project **Worktree roots** in
   Preferences, longest match wins) and launches like `cms <account>`. Built for

@@ -10,7 +10,7 @@ pub enum ScriptKind {
 
 /// Escapes single quotes for POSIX shell single-quoted strings.
 /// Each `'` in the value becomes `'\''` (close quote, escaped literal, reopen quote).
-fn posix_single_quote_escape(s: &str) -> String {
+pub(crate) fn posix_single_quote_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 

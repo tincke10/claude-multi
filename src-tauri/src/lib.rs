@@ -7,6 +7,7 @@ pub mod hook;
 pub mod hooks_install;
 pub mod inherit;
 pub mod launcher;
+pub mod orca;
 pub mod paths;
 pub mod session;
 pub mod summary;
@@ -30,6 +31,9 @@ pub fn run() {
             commands::get_config,
             commands::save_config,
             commands::test_tracking_connection,
+            commands::orca_health,
+            commands::list_orca_import_candidates,
+            commands::import_orca_repos,
             commands::list_terminals,
             commands::launch_session,
             commands::open_session,
