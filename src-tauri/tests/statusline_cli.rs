@@ -85,6 +85,33 @@ fn test_should_relay_original_statusline_through_the_sidecar() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), INPUT);
 }
 
+#[test]
+fn test_should_keep_stderr_empty_and_exit_zero_when_the_handler_panics() {
+    // The panic seam only exists in debug builds (cfg(debug_assertions)); the
+    // integration tests always run against a debug `cms`.
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cms"));
+    cmd.arg("--statusline")
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+        .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+        .env("CM_TEST_STATUSLINE_PANIC", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn cms");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(INPUT.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n");
+}
+
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {

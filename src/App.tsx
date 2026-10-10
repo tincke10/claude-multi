@@ -45,11 +45,16 @@ export default function App() {
   const { refresh } = ov;
   useEffect(() => {
     if (!IN_TAURI) return;
+    let alive = true;
     let unlisten: (() => void) | undefined;
     getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => { if (focused) { clearStatus(); void refresh(); } })
-      .then((u) => { unlisten = u; });
-    return () => unlisten?.();
+      .then((u) => {
+        // Unmounted before the subscription resolved: release it right away.
+        if (alive) unlisten = u; else u();
+      })
+      .catch(() => { /* no window events outside Tauri; nothing to clean up */ });
+    return () => { alive = false; unlisten?.(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

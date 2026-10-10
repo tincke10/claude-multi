@@ -307,7 +307,16 @@ pub fn handle(inv: &Invocation<'_>) -> String {
 
 /// Real entry point for `cms --statusline`: stdin -> stdout, always returns.
 pub fn run() {
+    // Claude Code renders our output: a panic must never print to stderr. The
+    // process exits right after, so the hook is never restored.
+    std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(|| {
+        // Test-only seam (debug builds): lets an integration test prove a panic
+        // in the handler never reaches stderr. Absent from release builds.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CM_TEST_STATUSLINE_PANIC").is_some() {
+            panic!("injected statusline panic");
+        }
         let Some(stdin) = read_capped(std::io::stdin().lock(), STDIN_CAP) else {
             return String::new();
         };
