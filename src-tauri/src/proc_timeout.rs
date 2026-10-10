@@ -39,6 +39,10 @@ pub fn run_with_timeout(
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
+    // Own process group so a timeout can kill the whole tree (a chained
+    // statusline may spawn grandchildren that would otherwise be orphaned).
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn()?;
 
     // Feed stdin from a thread: a child that never reads must not block us.
@@ -77,7 +81,7 @@ pub fn run_with_timeout(
         match child.try_wait()? {
             Some(st) => break (Some(st), false),
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 let _ = child.wait();
                 break (None, true);
             }
@@ -92,6 +96,21 @@ pub fn run_with_timeout(
         stdout,
         timed_out,
     })
+}
+
+/// Kills the child and, on Unix, its whole process group (the child is the
+/// group leader, so pgid == pid).
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pgid) = i32::try_from(child.id()) {
+            // SAFETY: plain syscall; negative pid targets the process group.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
 }
 
 #[cfg(all(test, unix))]
@@ -145,6 +164,34 @@ mod tests {
         .unwrap();
         assert!(out.timed_out);
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_should_kill_grandchildren_when_the_command_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let out = run_with_timeout(sh(&script), None, Duration::from_millis(500), 1024).unwrap();
+        assert!(out.timed_out);
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid recorded")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut alive = true;
+        while Instant::now() < deadline {
+            // SAFETY: signal 0 only probes for existence.
+            alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!alive, "grandchild {pid} leaked after timeout");
     }
 
     #[test]

@@ -506,6 +506,7 @@ dependencies = [
  "chrono",
  "dirs",
  "gethostname",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
