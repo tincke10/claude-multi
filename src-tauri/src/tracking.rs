@@ -96,6 +96,12 @@ pub fn tracking_env(
             format!("Authorization=Basic%20{}", pct_encode(&basic)),
         );
         put("OTEL_METRICS_INCLUDE_VERSION", "true".into());
+        // Claude Code exports delta by default; Grafana Cloud's OTLP gateway
+        // accepts the request but stores no series for delta counters.
+        put(
+            "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+            "cumulative".into(),
+        );
     } else {
         put("OTEL_METRICS_EXPORTER", "none".into());
     }
@@ -255,6 +261,12 @@ mod tests {
                 "Authorization=Basic%20MTIzNDU6Z2xjX2FiYw%3D%3D",
             ),
             ("OTEL_METRICS_INCLUDE_VERSION", "true"),
+            // Grafana Cloud's OTLP gateway keeps only cumulative series;
+            // Claude Code defaults to delta.
+            (
+                "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+                "cumulative",
+            ),
             ("OTEL_LOGS_EXPORT_INTERVAL", "5000"),
             (
                 "OTEL_RESOURCE_ATTRIBUTES",
@@ -301,6 +313,7 @@ mod tests {
         assert!(!m.contains_key("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"));
         assert!(!m.contains_key("OTEL_EXPORTER_OTLP_METRICS_HEADERS"));
         assert!(!m.contains_key("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"));
+        assert!(!m.contains_key("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"));
         assert_eq!(m["OTEL_LOGS_EXPORTER"], "otlp");
         assert!(m.contains_key("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"));
     }
